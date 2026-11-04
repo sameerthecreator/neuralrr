@@ -1,9 +1,5 @@
 #define RESHADE_ADDON_IMPL 1
-#ifndef _Frees_ptr_opt_
-#define _Frees_ptr_opt_
-#endif
-
-#include "reshade.hpp"
+#include <reshade.hpp>
 #include <onnxruntime_cxx_api.h>
 
 static Ort::Env* g_ort_env = nullptr;
@@ -28,9 +24,14 @@ static void on_destroy_effect_runtime(reshade::api::effect_runtime* runtime) {
     if (g_ort_env) { delete g_ort_env; g_ort_env = nullptr; }
 }
 
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "Neural Shader ONNX Runtime Hook";
+
 extern "C" __declspec(dllexport) bool ReShadePluginInit(void* hmodule) {
     HMODULE addon_mod = static_cast<HMODULE>(hmodule);
-    if (!reshade::register_addon(addon_mod)) return false;
+    if (!reshade::register_addon(addon_mod)) {
+        return false;
+    }
 
     reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
@@ -39,7 +40,6 @@ extern "C" __declspec(dllexport) bool ReShadePluginInit(void* hmodule) {
 
 extern "C" __declspec(dllexport) void ReShadePluginUninstall(void* hmodule) {
     HMODULE addon_mod = static_cast<HMODULE>(hmodule);
-    
     reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
     reshade::unregister_addon(addon_mod);
