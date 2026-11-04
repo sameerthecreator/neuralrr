@@ -4,14 +4,18 @@
 #include <Windows.h>
 #include <vector>
 #include <algorithm>
+#include <imgui.h>
 
 static Ort::Env* g_ort_env = nullptr;
 static Ort::Session* g_ort_session = nullptr;
 static Ort::MemoryInfo* g_memory_info = nullptr;
 
-// Staging textures for GPU <-> CPU transfer
 static reshade::api::resource g_staging_read = {0};
 static reshade::api::resource g_staging_write = {0};
+
+// UI Parameters
+static bool g_enable_shader = true;
+static float g_blend_intensity = 1.0f;
 
 static void on_init_effect_runtime(reshade::api::effect_runtime* runtime) {
     if (g_ort_session) return;
@@ -38,17 +42,24 @@ static void on_destroy_effect_runtime(reshade::api::effect_runtime* runtime) {
     if (g_ort_env) { delete g_ort_env; g_ort_env = nullptr; }
 }
 
+// Draw the UI in the ReShade overlay
+static void on_draw_settings(reshade::api::effect_runtime* runtime) {
+    ImGui::Checkbox("Enable ONNX Shader", &g_enable_shader);
+    ImGui::SliderFloat("Blend Intensity", &g_blend_intensity, 0.0f, 1.0f);
+}
+
 static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
-    if (!g_ort_session) return;
+    if (!g_ort_session || !g_enable_shader) return;
 
     reshade::api::device* device = queue->get_device();
+    reshade::api::command_list* cmd_list = queue->get_immediate_command_list();
+    
     reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
     reshade::api::resource_desc desc = device->get_resource_desc(backbuffer);
     
     int64_t width = desc.texture.width;
     int64_t height = desc.texture.height;
 
-    // Create persistent staging textures if they don't exist
     if (g_staging_read.handle == 0) {
         reshade::api::resource_desc stage_desc = desc;
         stage_desc.heap = reshade::api::memory_heap::gpu_to_cpu;
@@ -60,15 +71,13 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         device->create_resource(stage_desc, nullptr, reshade::api::resource_usage::copy_source, &g_staging_write);
     }
 
-    // 1. Copy GPU Backbuffer to CPU Read texture and sync
-    queue->copy_resource(backbuffer, g_staging_read);
-    queue->wait_idle(); // Pause engine to ensure copy finishes
+    // Use cmd_list to copy resources instead of queue
+    cmd_list->copy_resource(backbuffer, g_staging_read);
+    queue->wait_idle();
 
-    // 2. Map the Read texture memory
     reshade::api::subresource_data mapped_read;
     if (!device->map_texture_region(g_staging_read, 0, nullptr, reshade::api::map_access::read_only, &mapped_read)) return;
 
-    // Set up Tensors
     int64_t input_channels = 7;
     int64_t output_channels = 3;
     size_t plane_size = height * width;
@@ -76,7 +85,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     std::vector<float> input_tensor_values(plane_size * input_channels, 0.0f);
     std::vector<float> output_tensor_values(plane_size * output_channels, 0.0f);
 
-    // 3. Unpack 10-bit R10G10B10A2 pixels into float32 Tensors (NCHW layout)
     uint8_t* read_data = static_cast<uint8_t*>(mapped_read.data);
     for (int y = 0; y < height; ++y) {
         uint32_t* row = reinterpret_cast<uint32_t*>(read_data + y * mapped_read.row_pitch);
@@ -84,15 +92,13 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
             uint32_t pixel = row[x];
             int idx = y * width + x;
             
-            // Extract 10-bit chunks and normalize to 0.0 - 1.0
-            input_tensor_values[0 * plane_size + idx] = (pixel & 0x3FF) / 1023.0f;           // Red
-            input_tensor_values[1 * plane_size + idx] = ((pixel >> 10) & 0x3FF) / 1023.0f; // Green
-            input_tensor_values[2 * plane_size + idx] = ((pixel >> 20) & 0x3FF) / 1023.0f; // Blue
+            input_tensor_values[0 * plane_size + idx] = (pixel & 0x3FF) / 1023.0f;
+            input_tensor_values[1 * plane_size + idx] = ((pixel >> 10) & 0x3FF) / 1023.0f;
+            input_tensor_values[2 * plane_size + idx] = ((pixel >> 20) & 0x3FF) / 1023.0f;
         }
     }
     device->unmap_texture_region(g_staging_read, 0);
 
-    // 4. Run the Neural Network
     std::vector<int64_t> input_dims = {1, input_channels, height, width};
     std::vector<int64_t> output_dims = {1, output_channels, height, width};
 
@@ -106,33 +112,39 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         g_ort_session->Run(Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, &output_tensor, 1);
     } catch (...) { return; }
 
-    // 5. Map the Write texture memory
     reshade::api::subresource_data mapped_write;
     if (!device->map_texture_region(g_staging_write, 0, nullptr, reshade::api::map_access::write_only, &mapped_write)) return;
 
-    // 6. Pack float32 Tensors back into 10-bit pixels
     uint8_t* write_data = static_cast<uint8_t*>(mapped_write.data);
     for (int y = 0; y < height; ++y) {
         uint32_t* row = reinterpret_cast<uint32_t*>(write_data + y * mapped_write.row_pitch);
         for (int x = 0; x < width; ++x) {
             int idx = y * width + x;
             
-            float r = std::clamp(output_tensor_values[0 * plane_size + idx], 0.0f, 1.0f);
-            float g = std::clamp(output_tensor_values[1 * plane_size + idx], 0.0f, 1.0f);
-            float b = std::clamp(output_tensor_values[2 * plane_size + idx], 0.0f, 1.0f);
+            float r_orig = input_tensor_values[0 * plane_size + idx];
+            float g_orig = input_tensor_values[1 * plane_size + idx];
+            float b_orig = input_tensor_values[2 * plane_size + idx];
+
+            float r_ai = std::clamp(output_tensor_values[0 * plane_size + idx], 0.0f, 1.0f);
+            float g_ai = std::clamp(output_tensor_values[1 * plane_size + idx], 0.0f, 1.0f);
+            float b_ai = std::clamp(output_tensor_values[2 * plane_size + idx], 0.0f, 1.0f);
             
-            uint32_t r_int = static_cast<uint32_t>(r * 1023.0f);
-            uint32_t g_int = static_cast<uint32_t>(g * 1023.0f);
-            uint32_t b_int = static_cast<uint32_t>(b * 1023.0f);
-            uint32_t a_int = 3; // 2-bit full alpha
+            float r_final = r_orig + (r_ai - r_orig) * g_blend_intensity;
+            float g_final = g_orig + (g_ai - g_orig) * g_blend_intensity;
+            float b_final = b_orig + (b_ai - b_orig) * g_blend_intensity;
+
+            uint32_t r_int = static_cast<uint32_t>(r_final * 1023.0f);
+            uint32_t g_int = static_cast<uint32_t>(g_final * 1023.0f);
+            uint32_t b_int = static_cast<uint32_t>(b_final * 1023.0f);
+            uint32_t a_int = 3; 
             
             row[x] = r_int | (g_int << 10) | (b_int << 20) | (a_int << 30);
         }
     }
     device->unmap_texture_region(g_staging_write, 0);
 
-    // 7. Copy CPU Write texture back to GPU Backbuffer
-    queue->copy_resource(g_staging_write, backbuffer);
+    // Use cmd_list here too
+    cmd_list->copy_resource(g_staging_write, backbuffer);
 }
 
 extern "C" __declspec(dllexport) const char* NAME = "Neural Shader";
@@ -145,11 +157,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
             reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
             reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
             reshade::register_event<reshade::addon_event::present>(on_present);
+            reshade::register_overlay("Neural Shader", on_draw_settings);
             break;
         case DLL_PROCESS_DETACH:
             reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
             reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
             reshade::unregister_event<reshade::addon_event::present>(on_present);
+            reshade::unregister_overlay("Neural Shader", on_draw_settings);
             reshade::unregister_addon(hModule);
             break;
     }
