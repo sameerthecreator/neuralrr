@@ -26,7 +26,7 @@ static std::wstring get_addon_directory() {
     return (pos != std::wstring::npos) ? str_path.substr(0, pos + 1) : L"";
 }
 
-static void on_init_swapchain(reshade::api::swapchain* swapchain, bool) {
+static void on_init_swapchain(reshade::api::swapchain* swapchain) {
     if (!swapchain || g_ort_session) return;
     try {
         if (!g_ort_env) {
@@ -47,7 +47,7 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool) {
     } catch (...) {}
 }
 
-static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool) {
+static void on_destroy_swapchain(reshade::api::swapchain* swapchain) {
     if (!swapchain) return;
     reshade::api::device* device = swapchain->get_device();
     if (!device) return;
@@ -81,7 +81,7 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     if (!g_ai_enabled) return;
 
     if (!g_ort_session) {
-        on_init_swapchain(swapchain, false);
+        on_init_swapchain(swapchain);
         if (!g_ort_session) return;
     }
 
@@ -101,7 +101,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     bool is_10bit = (fmt == reshade::api::format::r10g10b10a2_unorm || fmt == reshade::api::format::b10g10r10a2_unorm);
     bool is_bgra = (fmt == reshade::api::format::b8g8r8a8_unorm || fmt == reshade::api::format::b8g8r8a8_unorm_srgb || fmt == reshade::api::format::b10g10r10a2_unorm);
 
-    // Staging resources: match resolution and format exactly to the backbuffer
     if (g_staging_color_read.handle == 0 || device->get_resource_desc(g_staging_color_read).texture.width != width) {
         if (g_staging_color_read.handle != 0) {
             device->destroy_resource(g_staging_color_read);
@@ -124,7 +123,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     reshade::api::command_list* cmd_list = queue->get_immediate_command_list();
     if (!cmd_list) return;
 
-    // 1:1 hardware copy to staging
     cmd_list->copy_resource(backbuffer, g_staging_color_read);
     queue->wait_idle();
 
@@ -171,7 +169,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     }
     device->unmap_texture_region(g_staging_color_read, 0);
 
-    // Run the complete ONNX model
     std::vector<int64_t> input_dims = { 1, input_channels, height, width };
     Ort::Value input_tensor_val = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), input_tensor.data(), input_tensor.size(), input_dims.data(), input_dims.size());
 
@@ -241,7 +238,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     }
     device->unmap_texture_region(g_staging_color_write, 0);
 
-    // Blit processed tensor output directly to the active presentation backbuffer
     cmd_list->copy_resource(g_staging_color_write, backbuffer);
 }
 
