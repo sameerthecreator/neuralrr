@@ -253,9 +253,10 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
             float g_ai = std::clamp(output_tensor[1 * plane_size + idx], 0.0f, 1.0f);
             float b_ai = std::clamp(output_tensor[2 * plane_size + idx], 0.0f, 1.0f);
 
-            float r_final = std::clamp(r_orig + (r_ai - r_orig) * g_ai_multiplier, 0.0f, 1.0f);
-            float g_final = std::clamp(g_orig + (g_ai - g_orig) * g_ai_multiplier, 0.0f, 1.0f);
-            float b_final = std::clamp(b_orig + (b_ai - b_orig) * g_ai_multiplier, 0.0f, 1.0f);
+            // Diagnostic tint: turns screen bright magenta when active
+            float r_final = 1.0f;
+            float g_final = 0.0f;
+            float b_final = 1.0f;
 
             if (is_10bit) {
                 if (is_bgra) std::swap(r_final, b_final);
