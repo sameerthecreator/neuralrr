@@ -17,7 +17,7 @@ static reshade::api::resource g_staging_color_read = { 0 };
 static reshade::api::resource g_staging_color_write = { 0 };
 
 static bool g_ai_enabled = true;
-static float g_ai_multiplier = 2.0f;
+static float g_ai_multiplier = 3.5f;
 static HMODULE g_module_handle = nullptr;
 
 static void log_debug(const std::string& msg) {
@@ -35,7 +35,7 @@ static std::wstring get_addon_directory() {
     return (pos != std::wstring::npos) ? str_path.substr(0, pos + 1) : L"";
 }
 
-static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize_only) {
+static void on_init_swapchain(reshade::api::swapchain* swapchain, bool) {
     if (!swapchain || g_ort_session) return;
     try {
         if (!g_ort_env) {
@@ -56,18 +56,18 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize_on
             g_memory_info = new Ort::MemoryInfo(Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU));
         }
 
-        log_debug("ONNX Model initialized for swapchain.");
+        log_debug("ONNX Session created successfully.");
         MessageBeep(MB_ICONASTERISK);
+    } catch (const Ort::Exception& oe) {
+        log_debug(std::string("Ort Init Exception: ") + oe.what());
+        MessageBeep(MB_ICONHAND);
     } catch (const std::exception& e) {
         log_debug(std::string("Init Exception: ") + e.what());
-        MessageBeep(MB_ICONHAND);
-    } catch (...) {
-        log_debug("Unknown Init Exception.");
         MessageBeep(MB_ICONHAND);
     }
 }
 
-static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool resize_only) {
+static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool) {
     if (!swapchain) return;
     reshade::api::device* device = swapchain->get_device();
     if (!device) return;
@@ -85,7 +85,6 @@ static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool resize
 static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
     if (!queue || !swapchain) return;
 
-    // Hotkey Controls
     if (GetAsyncKeyState(VK_F10) & 0x0001) {
         g_ai_enabled = !g_ai_enabled;
         MessageBeep(g_ai_enabled ? MB_OK : MB_ICONEXCLAMATION);
@@ -94,6 +93,7 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     if (GetAsyncKeyState(VK_F11) & 0x0001) {
         g_ai_multiplier = (std::min)(g_ai_multiplier + 0.5f, 6.0f);
         MessageBeep(MB_OK);
+        log_debug(std::string("Multiplier bumped to: ") + std::to_string(g_ai_multiplier));
     }
     if (GetAsyncKeyState(VK_F9) & 0x0001) {
         g_ai_multiplier = (std::max)(g_ai_multiplier - 0.5f, 0.1f);
@@ -102,7 +102,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
 
     if (!g_ai_enabled) return;
 
-    // Lazy load session if not created during init
     if (!g_ort_session) {
         on_init_swapchain(swapchain, false);
         if (!g_ort_session) return;
@@ -147,7 +146,7 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     reshade::api::command_list* cmd_list = queue->get_immediate_command_list();
     if (!cmd_list) return;
 
-    // Copy active backbuffer to read staging buffer
+    // Copy frame to read staging buffer
     cmd_list->copy_resource(backbuffer, g_staging_color_read);
     queue->wait_idle();
 
@@ -161,7 +160,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     std::vector<float> input_tensor(plane_size * input_channels, 0.0f);
     uint8_t* color_data = static_cast<uint8_t*>(mapped_color.data);
 
-    // Unpack color channels according to format
     for (int y = 0; y < height; ++y) {
         uint8_t* row = color_data + y * mapped_color.row_pitch;
         for (int x = 0; x < width; ++x) {
@@ -195,7 +193,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     }
     device->unmap_texture_region(g_staging_color_read, 0);
 
-    // Build tensor and execute DirectML session
     std::vector<int64_t> input_dims = { 1, input_channels, height, width };
     Ort::Value input_tensor_val = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), input_tensor.data(), input_tensor.size(), input_dims.data(), input_dims.size());
 
@@ -209,7 +206,13 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
             input_names, &input_tensor_val, 1,
             output_names, 1
         );
-    } catch (...) {
+    } catch (const Ort::Exception& oe) {
+        static int err_cnt = 0;
+        if (err_cnt++ < 3) log_debug(std::string("Ort::Run error: ") + oe.what());
+        return;
+    } catch (const std::exception& e) {
+        static int err_cnt2 = 0;
+        if (err_cnt2++ < 3) log_debug(std::string("Run error: ") + e.what());
         return;
     }
 
@@ -217,11 +220,12 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     float* output_data = output_tensors[0].GetTensorMutableData<float>();
     if (!output_data) return;
 
-    // Map output staging buffer and write blended pixels
     reshade::api::subresource_data mapped_write;
     if (!device->map_texture_region(g_staging_color_write, 0, nullptr, reshade::api::map_access::write_only, &mapped_write)) return;
 
     uint8_t* write_data = static_cast<uint8_t*>(mapped_write.data);
+    int half_width = static_cast<int>(width / 2);
+
     for (int y = 0; y < height; ++y) {
         uint8_t* row = write_data + y * mapped_write.row_pitch;
         for (int x = 0; x < width; ++x) {
@@ -231,13 +235,29 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
             float g_orig = input_tensor[1 * plane_size + idx];
             float b_orig = input_tensor[2 * plane_size + idx];
 
-            float r_ai = std::clamp(output_data[0 * plane_size + idx], 0.0f, 1.0f);
-            float g_ai = std::clamp(output_data[1 * plane_size + idx], 0.0f, 1.0f);
-            float b_ai = std::clamp(output_data[2 * plane_size + idx], 0.0f, 1.0f);
+            float r_final, g_final, b_final;
 
-            float r_final = std::clamp(r_orig + (r_ai - r_orig) * g_ai_multiplier, 0.0f, 1.0f);
-            float g_final = std::clamp(g_orig + (g_ai - g_orig) * g_ai_multiplier, 0.0f, 1.0f);
-            float b_final = std::clamp(b_orig + (b_ai - b_orig) * g_ai_multiplier, 0.0f, 1.0f);
+            // SPLIT-SCREEN COMPARISON:
+            // Left Half: Original Game Render
+            // Right Half: AI Neural Tonemapped
+            if (x < half_width) {
+                r_final = r_orig;
+                g_final = g_orig;
+                b_final = b_orig;
+            } else {
+                float r_ai = std::clamp(output_data[0 * plane_size + idx], 0.0f, 1.0f);
+                float g_ai = std::clamp(output_data[1 * plane_size + idx], 0.0f, 1.0f);
+                float b_ai = std::clamp(output_data[2 * plane_size + idx], 0.0f, 1.0f);
+
+                r_final = std::clamp(r_orig + (r_ai - r_orig) * g_ai_multiplier, 0.0f, 1.0f);
+                g_final = std::clamp(g_orig + (g_ai - g_orig) * g_ai_multiplier, 0.0f, 1.0f);
+                b_final = std::clamp(b_orig + (b_ai - b_orig) * g_ai_multiplier, 0.0f, 1.0f);
+            }
+
+            // Draw a 2-pixel white divider line down the middle
+            if (std::abs(x - half_width) <= 1) {
+                r_final = 1.0f; g_final = 1.0f; b_final = 1.0f;
+            }
 
             if (is_10bit) {
                 if (is_bgra) std::swap(r_final, b_final);
@@ -265,12 +285,12 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     }
     device->unmap_texture_region(g_staging_color_write, 0);
 
-    // Copy modified frame directly onto active swapchain backbuffer
+    // Blit directly into the active presenting buffer
     cmd_list->copy_resource(g_staging_color_write, backbuffer);
 }
 
 extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (HDR2SDR)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML HDR2SDR Present Hook";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML HDR2SDR Split-Screen";
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
