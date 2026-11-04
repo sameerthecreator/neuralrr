@@ -24,8 +24,8 @@ static void on_init_effect_runtime(reshade::api::effect_runtime* runtime) {
         session_options.SetIntraOpNumThreads(4);
         session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
-        // DirectML GPU acceleration
-        Ort::ThrowOnError(OrtSessionOptionsAppendExecutionProvider_DML(session_options, 0));
+        // Attach DirectML GPU provider
+        OrtSessionOptionsAppendExecutionProvider_DML(session_options, 0);
 
         const wchar_t* model_path = L"neural_shader_gtx1650_sharp.onnx";
         g_ort_session = new Ort::Session(*g_ort_env, model_path, session_options);
@@ -36,18 +36,33 @@ static void on_init_effect_runtime(reshade::api::effect_runtime* runtime) {
 
 static void on_destroy_effect_runtime(reshade::api::effect_runtime* runtime) {
     reshade::api::device* device = runtime->get_device();
-    if (g_staging_read.handle != 0) { device->destroy_resource(g_staging_read); g_staging_read = {0}; }
-    if (g_staging_write.handle != 0) { device->destroy_resource(g_staging_write); g_staging_write = {0}; }
+    if (g_staging_read.handle != 0) { 
+        device->destroy_resource(g_staging_read); 
+        g_staging_read = {0}; 
+    }
+    if (g_staging_write.handle != 0) { 
+        device->destroy_resource(g_staging_write); 
+        g_staging_write = {0}; 
+    }
     
-    if (g_memory_info) { delete g_memory_info; g_memory_info = nullptr; }
-    if (g_ort_session) { delete g_ort_session; g_ort_session = nullptr; }
-    if (g_ort_env) { delete g_ort_env; g_ort_env = nullptr; }
+    if (g_memory_info) { 
+        delete g_memory_info; 
+        g_memory_info = nullptr; 
+    }
+    if (g_ort_session) { 
+        delete g_ort_session; 
+        g_ort_session = nullptr; 
+    }
+    if (g_ort_env) { 
+        delete g_ort_env; 
+        g_ort_env = nullptr; 
+    }
 }
 
 static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
     if (!g_ort_session) return;
 
-    // Controls: F10 = Toggle ON/OFF | F11 = Multiplier Up | F9 = Multiplier Down
+    // Hotkeys: F10 = On/Off, F11 = Multiplier Up, F9 = Multiplier Down
     if (GetAsyncKeyState(VK_F10) & 0x0001) {
         g_ai_enabled = !g_ai_enabled;
     }
@@ -110,4 +125,67 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     std::vector<int64_t> input_dims = {1, input_channels, height, width};
     std::vector<int64_t> output_dims = {1, output_channels, height, width};
 
-    Ort::Value input_tensor = Ort::Value::CreateTensor
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), input_tensor_values.data(), input_tensor_values.size(), input_dims.data(), input_dims.size());
+    Ort::Value output_tensor = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), output_tensor_values.data(), output_tensor_values.size(), output_dims.data(), output_dims.size());
+
+    const char* input_names[] = {"g_buffer"};
+    const char* output_names[] = {"rendered_frame"};
+
+    try {
+        g_ort_session->Run(Ort::RunOptions{nullptr}, input_names, &input_tensor, 1, output_names, &output_tensor, 1);
+    } catch (...) { return; }
+
+    reshade::api::subresource_data mapped_write;
+    if (!device->map_texture_region(g_staging_write, 0, nullptr, reshade::api::map_access::write_only, &mapped_write)) return;
+
+    uint8_t* write_data = static_cast<uint8_t*>(mapped_write.data);
+    for (int y = 0; y < height; ++y) {
+        uint32_t* row = reinterpret_cast<uint32_t*>(write_data + y * mapped_write.row_pitch);
+        for (int x = 0; x < width; ++x) {
+            int idx = y * width + x;
+            
+            float r_orig = input_tensor_values[0 * plane_size + idx];
+            float g_orig = input_tensor_values[1 * plane_size + idx];
+            float b_orig = input_tensor_values[2 * plane_size + idx];
+
+            float r_ai = std::clamp(output_tensor_values[0 * plane_size + idx], 0.0f, 1.0f);
+            float g_ai = std::clamp(output_tensor_values[1 * plane_size + idx], 0.0f, 1.0f);
+            float b_ai = std::clamp(output_tensor_values[2 * plane_size + idx], 0.0f, 1.0f);
+            
+            float r_final = std::clamp(r_orig + (r_ai - r_orig) * g_ai_multiplier, 0.0f, 1.0f);
+            float g_final = std::clamp(g_orig + (g_ai - g_orig) * g_ai_multiplier, 0.0f, 1.0f);
+            float b_final = std::clamp(b_orig + (b_ai - b_orig) * g_ai_multiplier, 0.0f, 1.0f);
+
+            uint32_t r_int = static_cast<uint32_t>(r_final * 1023.0f);
+            uint32_t g_int = static_cast<uint32_t>(g_final * 1023.0f);
+            uint32_t b_int = static_cast<uint32_t>(b_final * 1023.0f);
+            uint32_t a_int = 3; 
+            
+            row[x] = r_int | (g_int << 10) | (b_int << 20) | (a_int << 30);
+        }
+    }
+    device->unmap_texture_region(g_staging_write, 0);
+
+    cmd_list->copy_resource(g_staging_write, backbuffer);
+}
+
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "ONNX Neural Shader Hook";
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
+    switch (fdwReason) {
+        case DLL_PROCESS_ATTACH:
+            if (!reshade::register_addon(hModule)) return FALSE;
+            reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
+            reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
+            reshade::register_event<reshade::addon_event::present>(on_present);
+            break;
+        case DLL_PROCESS_DETACH:
+            reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
+            reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
+            reshade::unregister_event<reshade::addon_event::present>(on_present);
+            reshade::unregister_addon(hModule);
+            break;
+    }
+    return TRUE;
+}
