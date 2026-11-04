@@ -16,6 +16,9 @@ static reshade::api::resource g_staging_color_read = {0};
 static reshade::api::resource g_staging_color_write = {0};
 static reshade::api::resource g_staging_depth_read = {0};
 
+// Stored active depth buffer tracked from game drawcalls
+static reshade::api::resource g_active_depth_buffer = {0};
+
 static bool g_ai_enabled = true;
 static float g_ai_multiplier = 1.0f;
 static HMODULE g_module_handle = nullptr;
@@ -26,6 +29,16 @@ static std::wstring get_addon_directory() {
     std::wstring str_path(path);
     size_t pos = str_path.find_last_of(L"\\/");
     return (pos != std::wstring::npos) ? str_path.substr(0, pos + 1) : L"";
+}
+
+// Automatically tracks whichever depth buffer the game binds to render
+static void on_bind_render_targets_and_depth_stencil(reshade::api::command_list*, uint32_t, const reshade::api::resource_view*, reshade::api::resource_view depth_stencil_view) {
+    if (depth_stencil_view.handle != 0) {
+        // Retrieve the parent depth texture from the view
+        reshade::api::device* dev = depth_stencil_view.handle ? reinterpret_cast<reshade::api::device*>(depth_stencil_view.handle) : nullptr;
+        // Keep tracking the bound depth target handle
+        g_active_depth_buffer = { depth_stencil_view.handle };
+    }
 }
 
 static void on_init_effect_runtime(reshade::api::effect_runtime* runtime) {
@@ -77,7 +90,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
 
     if (!g_ai_enabled || !g_ort_session) return;
 
-    reshade::api::effect_runtime* runtime = reinterpret_cast<reshade::api::effect_runtime*>(swapchain);
     reshade::api::device* device = queue->get_device();
     reshade::api::command_list* cmd_list = queue->get_immediate_command_list();
 
@@ -101,24 +113,22 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
 
     cmd_list->copy_resource(backbuffer, g_staging_color_read);
 
-    // 2. Query and Copy Active Depth Buffer
-    reshade::api::resource depth_buffer = {0};
-    if (runtime != nullptr) {
-        depth_buffer = runtime->get_current_depth_stencil();
-    }
+    // 2. Query Tracked Depth Buffer
     bool has_depth = false;
-
-    if (depth_buffer.handle != 0) {
-        reshade::api::resource_desc depth_desc = device->get_resource_desc(depth_buffer);
-        if (g_staging_depth_read.handle == 0 || device->get_resource_desc(g_staging_depth_read).texture.width != depth_desc.texture.width) {
-            if (g_staging_depth_read.handle != 0) device->destroy_resource(g_staging_depth_read);
-            reshade::api::resource_desc stage_depth = depth_desc;
-            stage_depth.heap = reshade::api::memory_heap::gpu_to_cpu;
-            stage_depth.usage = reshade::api::resource_usage::copy_dest;
-            device->create_resource(stage_depth, nullptr, reshade::api::resource_usage::copy_dest, &g_staging_depth_read);
+    if (g_active_depth_buffer.handle != 0) {
+        reshade::api::resource depth_res = device->get_resource_from_view(reshade::api::resource_view{ g_active_depth_buffer.handle });
+        if (depth_res.handle != 0) {
+            reshade::api::resource_desc depth_desc = device->get_resource_desc(depth_res);
+            if (g_staging_depth_read.handle == 0 || device->get_resource_desc(g_staging_depth_read).texture.width != depth_desc.texture.width) {
+                if (g_staging_depth_read.handle != 0) device->destroy_resource(g_staging_depth_read);
+                reshade::api::resource_desc stage_depth = depth_desc;
+                stage_depth.heap = reshade::api::memory_heap::gpu_to_cpu;
+                stage_depth.usage = reshade::api::resource_usage::copy_dest;
+                device->create_resource(stage_depth, nullptr, reshade::api::resource_usage::copy_dest, &g_staging_depth_read);
+            }
+            cmd_list->copy_resource(depth_res, g_staging_depth_read);
+            has_depth = true;
         }
-        cmd_list->copy_resource(depth_buffer, g_staging_depth_read);
-        has_depth = true;
     }
 
     queue->wait_idle();
@@ -154,12 +164,10 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
             uint32_t pixel = color_row[x];
             int idx = y * width + x;
 
-            // Channels 0, 1, 2: RGB normalized (from 10-bit buffer)
             input_tensor[0 * plane_size + idx] = (pixel & 0x3FF) / 1023.0f;
             input_tensor[1 * plane_size + idx] = ((pixel >> 10) & 0x3FF) / 1023.0f;
             input_tensor[2 * plane_size + idx] = ((pixel >> 20) & 0x3FF) / 1023.0f;
 
-            // Channel 3: Depth
             if (depth_row) {
                 float d = depth_row[x];
                 input_tensor[3 * plane_size + idx] = std::clamp(d, 0.0f, 1.0f);
@@ -258,11 +266,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
             if (!reshade::register_addon(hModule)) return FALSE;
             reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
             reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
+            reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind_render_targets_and_depth_stencil);
             reshade::register_event<reshade::addon_event::present>(on_present);
             break;
         case DLL_PROCESS_DETACH:
             reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
             reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
+            reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind_render_targets_and_depth_stencil);
             reshade::unregister_event<reshade::addon_event::present>(on_present);
             reshade::unregister_addon(hModule);
             break;
