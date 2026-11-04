@@ -59,11 +59,20 @@ jobs:
 
         Copy-Item -Path "onnxruntime\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
 
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: d3d12-benchmark-build
+        path: |
+          build/Release/*.dll
+          build/Release/*.exe
+
     - name: Upload compiled addon artifacts
       uses: actions/upload-artifact@v4
       with:
         name: neural_shader_addon
         path: |
+        
           neural_shader.dll
           onnxruntime.dll
           DirectML.dll
