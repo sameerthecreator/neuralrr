@@ -168,7 +168,7 @@ static bool InitNeuralPipeline(ID3D12Device* device, ID3D12CommandQueue* queue) 
 
     // 4. Bind Zero-Copy D3D12 VRAM Allocations to ORT Values
     g_ctx.ortDml->CreateGPUAllocationFromD3DResource(g_ctx.inBuffer.Get(), &g_ctx.dmlInAlloc);
-    g_ctx.ortDml->CreateGPUAllocationFromD3DResource(g_ctx.outBuffer.Get(), &dmlOutAlloc);
+    g_ctx.ortDml->CreateGPUAllocationFromD3DResource(g_ctx.outBuffer.Get(), &g_ctx.dmlOutAlloc);
 
     g_ctx.ort->CreateMemoryInfo("DML", OrtDeviceAllocator, 0, OrtMemTypeDefault, &g_ctx.memInfo);
 
