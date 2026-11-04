@@ -80,7 +80,21 @@ int main() {
         return -1;
     }
 
-    // 2. Allocate VRAM Buffers in GPU Default Heap
+    // 2. Create D3D12 Command Queue & Command List for explicit GPU state transitions
+    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    queueDesc.Flags = D3D12_COMMAND_QUEUE_FLAG_NONE;
+
+    ComPtr<ID3D12CommandQueue> cmdQueue;
+    device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&cmdQueue));
+
+    ComPtr<ID3D12CommandAllocator> cmdAlloc;
+    device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&cmdAlloc));
+
+    ComPtr<ID3D12GraphicsCommandList> cmdList;
+    device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmdAlloc.Get(), nullptr, IID_PPV_ARGS(&cmdList));
+
+    // 3. Allocate VRAM Buffers in GPU Default Heap
     size_t inBytes = (size_t)WIDTH * HEIGHT * IN_CHANNELS * sizeof(float);
     size_t outBytes = (size_t)WIDTH * HEIGHT * OUT_CHANNELS * sizeof(float);
 
@@ -92,7 +106,36 @@ int main() {
 
     if (!inBuffer || !outBuffer) return -1;
 
-    // 3. Connect to ORT API Version 17
+    // Transition buffers from COMMON to UNORDERED_ACCESS state required by DirectML
+    D3D12_RESOURCE_BARRIER barriers[2] = {};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[0].Transition.pResource = inBuffer.Get();
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[1].Transition.pResource = outBuffer.Get();
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+    cmdList->ResourceBarrier(2, barriers);
+    cmdList->Close();
+
+    ID3D12CommandList* ppCommandLists[] = { cmdList.Get() };
+    cmdQueue->ExecuteCommandLists(1, ppCommandLists);
+
+    // Synchronize GPU queue execution
+    ComPtr<ID3D12Fence> fence;
+    device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+    cmdQueue->Signal(fence.Get(), 1);
+    HANDLE fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    fence->SetEventOnCompletion(1, fenceEvent);
+    WaitForSingleObject(fenceEvent, INFINITE);
+    CloseHandle(fenceEvent);
+
+    // 4. Initialize ORT using the active D3D12 Command Queue
     const OrtApiBase* apiBase = OrtGetApiBase();
     const OrtApi* ort = apiBase->GetApi(17);
     if (!ort) {
@@ -114,7 +157,9 @@ int main() {
     ort->CreateSessionOptions(&sessionOptions);
     ort->SetIntraOpNumThreads(sessionOptions, 4);
     ort->SetSessionGraphOptimizationLevel(sessionOptions, ORT_ENABLE_EXTENDED);
-    OrtSessionOptionsAppendExecutionProvider_DML(sessionOptions, 0);
+
+    // Bind DirectML explicitly to our initialized D3D12 Device and Command Queue
+    ortDmlApi->SessionOptionsAppendExecutionProvider_DML1(sessionOptions, device.Get(), cmdQueue.Get());
 
     const wchar_t* modelPath = L"neural_shader_gtx1650_sharp.onnx";
     std::cout << "Loading ONNX model graph into DirectML...\n";
@@ -127,7 +172,7 @@ int main() {
     }
     std::cout << "Model loaded successfully!\n\n";
 
-    // 4. Wrap D3D12 VRAM Resources into DirectML Tensors (Zero-Copy)
+    // 5. Wrap D3D12 VRAM Resources into DirectML Tensors (Zero-Copy)
     void* dmlInAlloc = nullptr;
     void* dmlOutAlloc = nullptr;
     ortDmlApi->CreateGPUAllocationFromD3DResource(inBuffer.Get(), &dmlInAlloc);
@@ -150,7 +195,7 @@ int main() {
         ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &outTensor
     );
 
-    // 5. Setup IOBinding
+    // 6. Setup IOBinding
     OrtIoBinding* ioBinding = nullptr;
     ort->CreateIoBinding(session, &ioBinding);
     ort->BindInput(ioBinding, "g_buffer", inTensor);
@@ -159,7 +204,7 @@ int main() {
     OrtRunOptions* runOptions = nullptr;
     ort->CreateRunOptions(&runOptions);
 
-    // 6. Warmup Run
+    // 7. Warmup Run
     std::cout << "Warming up DirectML pipeline on GPU...\n";
     status = ort->RunWithBinding(session, runOptions, ioBinding);
     if (status != nullptr) {
@@ -169,7 +214,7 @@ int main() {
     }
     std::cout << "Warmup successful!\n\n";
 
-    // 7. Benchmark 50 Sequential Executions
+    // 8. Benchmark 50 Sequential Executions
     std::cout << "Benchmarking 50 frames of GPU-to-GPU inference...\n";
     auto start = std::chrono::high_resolution_clock::now();
 
