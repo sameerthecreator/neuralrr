@@ -20,6 +20,7 @@
 
 using Microsoft::WRL::ComPtr;
 
+// 432p Target (768x432: 32.7 ms per pass on GTX 1650)
 constexpr int IN_WIDTH       = 768;
 constexpr int IN_HEIGHT      = 432;
 constexpr int IN_CHANNELS    = 7;
@@ -66,7 +67,7 @@ struct NeuralContext {
 };
 
 static NeuralContext g_ctx;
-static std::mutex g_inferenceMutex;
+static std::atomic<bool> g_isInferring{false};
 
 static ComPtr<ID3D12Resource> CreateLinearBuffer(ID3D12Device* device, size_t sizeBytes) {
     D3D12_HEAP_PROPERTIES heapProps = {};
@@ -92,20 +93,26 @@ static ComPtr<ID3D12Resource> CreateLinearBuffer(ID3D12Device* device, size_t si
 
 static void AsyncInitDirectML() {
     if (g_ctx.logFile.is_open()) {
-        g_ctx.logFile << "[NeuralShader] Background initialization thread started.\n";
+        g_ctx.logFile << "[NeuralShader] Background initialization thread started (432p: 768x432).\n";
         g_ctx.logFile.flush();
     }
 
     g_ctx.hDml = LoadLibraryA("DirectML.dll");
     if (!g_ctx.hDml) {
-        if (g_ctx.logFile.is_open()) g_ctx.logFile << "[NeuralShader] ERROR: Failed to load DirectML.dll\n";
+        if (g_ctx.logFile.is_open()) {
+            g_ctx.logFile << "[NeuralShader] ERROR: Failed to load DirectML.dll\n";
+            g_ctx.logFile.flush();
+        }
         g_ctx.has_failed = true;
         return;
     }
 
     auto pfnDMLCreateDevice = reinterpret_cast<PFN_DMLCreateDevice>(GetProcAddress(g_ctx.hDml, "DMLCreateDevice"));
     if (!pfnDMLCreateDevice || FAILED(pfnDMLCreateDevice(g_ctx.d3d12Device.Get(), DML_CREATE_DEVICE_FLAG_NONE, IID_PPV_ARGS(&g_ctx.dmlDevice)))) {
-        if (g_ctx.logFile.is_open()) g_ctx.logFile << "[NeuralShader] ERROR: Failed to create DirectML device.\n";
+        if (g_ctx.logFile.is_open()) {
+            g_ctx.logFile << "[NeuralShader] ERROR: Failed to create DirectML device.\n";
+            g_ctx.logFile.flush();
+        }
         g_ctx.has_failed = true;
         return;
     }
@@ -116,7 +123,10 @@ static void AsyncInitDirectML() {
     g_ctx.inBuffer  = CreateLinearBuffer(g_ctx.d3d12Device.Get(), inBytes);
     g_ctx.outBuffer = CreateLinearBuffer(g_ctx.d3d12Device.Get(), outBytes);
     if (!g_ctx.inBuffer || !g_ctx.outBuffer) {
-        if (g_ctx.logFile.is_open()) g_ctx.logFile << "[NeuralShader] ERROR: Failed to allocate GPU VRAM linear buffers.\n";
+        if (g_ctx.logFile.is_open()) {
+            g_ctx.logFile << "[NeuralShader] ERROR: Failed to allocate GPU VRAM linear buffers.\n";
+            g_ctx.logFile.flush();
+        }
         g_ctx.has_failed = true;
         return;
     }
@@ -139,7 +149,6 @@ static void AsyncInitDirectML() {
     g_ctx.ort->SetIntraOpNumThreads(g_ctx.sessionOptions, 4);
     g_ctx.ort->SetSessionGraphOptimizationLevel(g_ctx.sessionOptions, ORT_ENABLE_EXTENDED);
 
-    // Disable crash-prone metacommands on TU117
     SetEnvironmentVariableA("DML_DISABLE_METACMDS", "1");
     g_ctx.ortDml->SessionOptionsAppendExecutionProvider_DML1(g_ctx.sessionOptions, g_ctx.dmlDevice.Get(), g_ctx.cmdQueue.Get());
 
@@ -172,7 +181,7 @@ static void AsyncInitDirectML() {
     g_ctx.ort->CreateRunOptions(&g_ctx.runOptions);
 
     if (g_ctx.logFile.is_open()) {
-        g_ctx.logFile << "[NeuralShader] DirectML session initialized and ready for real-time inference!\n";
+        g_ctx.logFile << "[NeuralShader] DirectML 432p session initialized and ready for real-time inference!\n";
         g_ctx.logFile.flush();
     }
 
@@ -185,7 +194,7 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     if (swapchain->get_device()->get_api() != reshade::api::device_api::d3d12) return;
     if (g_ctx.has_failed) return;
 
-    // Start background initialization after the game renders its first few frames
+    // Start background initialization after passing frame 30
     if (!g_ctx.is_ready && !g_ctx.is_loading && frame > 30) {
         g_ctx.is_loading = true;
         g_ctx.d3d12Device = reinterpret_cast<ID3D12Device*>(swapchain->get_device()->get_native());
@@ -195,12 +204,16 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         initThread.detach();
     }
 
-    // Run inference only when the session is loaded
-    if (g_ctx.is_ready) {
-        std::unique_lock<std::mutex> lock(g_inferenceMutex, std::try_to_lock);
-        if (lock.owns_lock()) {
+    // Paced execution: run only on alternate frames and guard against queue saturation
+    if (g_ctx.is_ready && (frame % 2 == 0)) {
+        bool expected = false;
+        if (g_isInferring.compare_exchange_strong(expected, true)) {
             OrtStatus* status = g_ctx.ort->RunWithBinding(g_ctx.session, g_ctx.runOptions, g_ctx.ioBinding);
             if (status != nullptr) {
+                if (g_ctx.logFile.is_open()) {
+                    g_ctx.logFile << "[NeuralShader] Error during RunWithBinding: " << g_ctx.ort->GetErrorMessage(status) << "\n";
+                    g_ctx.logFile.flush();
+                }
                 g_ctx.ort->ReleaseStatus(status);
             } else {
                 uint64_t aiCount = ++g_ctx.ai_frames;
@@ -209,12 +222,13 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
                     g_ctx.logFile.flush();
                 }
             }
+            g_isInferring.store(false);
         }
     }
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (DirectML Async)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Non-blocking DirectML Zero-Copy Addon for Forza Horizon 2";
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (432p DirectML)";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "Paced DirectML Zero-Copy Addon for Forza Horizon 2 (768x432)";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
@@ -229,7 +243,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
 
         g_ctx.logFile.open("neural_shader_debug.txt", std::ios::out);
         if (g_ctx.logFile.is_open()) {
-            g_ctx.logFile << "[NeuralShader] Addon attached.\n";
+            g_ctx.logFile << "[NeuralShader] Addon attached (432p target).\n";
             g_ctx.logFile.flush();
         }
 
