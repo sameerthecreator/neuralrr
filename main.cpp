@@ -20,7 +20,6 @@
 
 using Microsoft::WRL::ComPtr;
 
-// 432p Target (768x432)
 constexpr int IN_WIDTH       = 768;
 constexpr int IN_HEIGHT      = 432;
 constexpr int IN_CHANNELS    = 7;
@@ -40,18 +39,22 @@ struct NeuralContext {
     std::atomic<uint64_t> total_frames{0};
     std::atomic<uint64_t> ai_frames{0};
 
+    ComPtr<ID3D12Device> d3d12Device;
+    HMODULE hDml = nullptr;
+    ComPtr<IDMLDevice> dmlDevice;
+
     const OrtApi* ort = nullptr;
+    const OrtDmlApi* ortDml = nullptr;
     OrtEnv* env = nullptr;
     OrtSessionOptions* sessionOptions = nullptr;
     OrtSession* session = nullptr;
     OrtMemoryInfo* memInfo = nullptr;
     OrtValue* inTensor = nullptr;
-    OrtValue* outTensor = nullptr;
-    OrtIoBinding* ioBinding = nullptr;
-    OrtRunOptions* runOptions = nullptr;
 
-    std::vector<float> dummyInput;
-    std::vector<float> dummyOutput;
+    const char* inputNames[1]  = { "g_buffer" };
+    const char* outputNames[1] = { "rendered_frame" };
+
+    std::vector<float> inputData;
 
     std::wstring modelDirectory;
     std::ofstream logFile;
@@ -62,8 +65,22 @@ static std::atomic<bool> g_isInferring{false};
 
 static void AsyncInitDirectML() {
     if (g_ctx.logFile.is_open()) {
-        g_ctx.logFile << "[NeuralShader] Background thread: initializing isolated DirectML context...\n";
+        g_ctx.logFile << "[NeuralShader] Background thread initializing on Azimuth's active GPU...\n";
         g_ctx.logFile.flush();
+    }
+
+    g_ctx.hDml = LoadLibraryA("DirectML.dll");
+    if (!g_ctx.hDml) {
+        if (g_ctx.logFile.is_open()) g_ctx.logFile << "[NeuralShader] ERROR: Failed to load DirectML.dll\n";
+        g_ctx.has_failed = true;
+        return;
+    }
+
+    auto pfnDMLCreateDevice = reinterpret_cast<PFN_DMLCreateDevice>(GetProcAddress(g_ctx.hDml, "DMLCreateDevice"));
+    if (!pfnDMLCreateDevice || FAILED(pfnDMLCreateDevice(g_ctx.d3d12Device.Get(), DML_CREATE_DEVICE_FLAG_NONE, IID_PPV_ARGS(&g_ctx.dmlDevice)))) {
+        if (g_ctx.logFile.is_open()) g_ctx.logFile << "[NeuralShader] ERROR: Failed to create DirectML device on game GPU.\n";
+        g_ctx.has_failed = true;
+        return;
     }
 
     const OrtApiBase* apiBase = OrtGetApiBase();
@@ -73,16 +90,21 @@ static void AsyncInitDirectML() {
         return;
     }
 
+    g_ctx.ort->GetExecutionProviderApi("DML", 17, reinterpret_cast<const void**>(&g_ctx.ortDml));
+    if (!g_ctx.ortDml) {
+        g_ctx.has_failed = true;
+        return;
+    }
+
     g_ctx.ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "Azimuth_NeuralShader", &g_ctx.env);
     g_ctx.ort->CreateSessionOptions(&g_ctx.sessionOptions);
-    g_ctx.ort->SetIntraOpNumThreads(g_ctx.sessionOptions, 4);
-    g_ctx.ort->SetSessionGraphOptimizationLevel(g_ctx.sessionOptions, ORT_ENABLE_EXTENDED);
+    g_ctx.ort->SetIntraOpNumThreads(g_ctx.sessionOptions, 2);
+    g_ctx.ort->SetSessionGraphOptimizationLevel(g_ctx.sessionOptions, ORT_ENABLE_BASIC);
 
-    // Disable crash-prone metacommands on Turing (TU117)
     SetEnvironmentVariableA("DML_DISABLE_METACMDS", "1");
 
-    // Use isolated DirectML device 0 (GTX 1650) - zero interference with Azimuth's D3D12 queue
-    OrtSessionOptionsAppendExecutionProvider_DML(g_ctx.sessionOptions, 0);
+    // Pass Azimuth's GTX 1650 DML device, with nullptr queue so DML creates its own dedicated queue on the SAME GPU
+    g_ctx.ortDml->SessionOptionsAppendExecutionProvider_DML1(g_ctx.sessionOptions, g_ctx.dmlDevice.Get(), nullptr);
 
     std::wstring fullModelPath = g_ctx.modelDirectory + L"\\neural_shader_gtx1650_432p.onnx";
     OrtStatus* status = g_ctx.ort->CreateSession(g_ctx.env, fullModelPath.c_str(), g_ctx.sessionOptions, &g_ctx.session);
@@ -96,33 +118,20 @@ static void AsyncInitDirectML() {
         return;
     }
 
-    // Allocate memory
-    size_t inElements  = (size_t)IN_WIDTH * IN_HEIGHT * IN_CHANNELS;
-    size_t outElements = (size_t)IN_WIDTH * IN_HEIGHT * OUT_CHANNELS;
-    g_ctx.dummyInput.resize(inElements, 0.5f);
-    g_ctx.dummyOutput.resize(outElements, 0.0f);
+    size_t inElements = (size_t)IN_WIDTH * IN_HEIGHT * IN_CHANNELS;
+    g_ctx.inputData.assign(inElements, 0.5f);
 
     g_ctx.ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &g_ctx.memInfo);
 
-    int64_t inShape[]  = { 1, IN_CHANNELS, IN_HEIGHT, IN_WIDTH };
-    int64_t outShape[] = { 1, OUT_CHANNELS, IN_HEIGHT, IN_WIDTH };
+    int64_t inShape[] = { 1, IN_CHANNELS, IN_HEIGHT, IN_WIDTH };
 
     g_ctx.ort->CreateTensorWithDataAsOrtValue(
-        g_ctx.memInfo, g_ctx.dummyInput.data(), inElements * sizeof(float),
+        g_ctx.memInfo, g_ctx.inputData.data(), inElements * sizeof(float),
         inShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &g_ctx.inTensor
     );
-    g_ctx.ort->CreateTensorWithDataAsOrtValue(
-        g_ctx.memInfo, g_ctx.dummyOutput.data(), outElements * sizeof(float),
-        outShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &g_ctx.outTensor
-    );
-
-    g_ctx.ort->CreateIoBinding(g_ctx.session, &g_ctx.ioBinding);
-    g_ctx.ort->BindInput(g_ctx.ioBinding, "g_buffer", g_ctx.inTensor);
-    g_ctx.ort->BindOutput(g_ctx.ioBinding, "rendered_frame", g_ctx.outTensor);
-    g_ctx.ort->CreateRunOptions(&g_ctx.runOptions);
 
     if (g_ctx.logFile.is_open()) {
-        g_ctx.logFile << "[NeuralShader] DirectML isolated session initialized successfully!\n";
+        g_ctx.logFile << "[NeuralShader] DirectML session initialized on GTX 1650 with dedicated queue!\n";
         g_ctx.logFile.flush();
     }
 
@@ -135,25 +144,40 @@ static void on_present(reshade::api::command_queue*, reshade::api::swapchain* sw
     if (swapchain->get_device()->get_api() != reshade::api::device_api::d3d12) return;
     if (g_ctx.has_failed) return;
 
-    // Start background init only after 60 smooth presentation frames have passed
+    // Start background thread once the engine is actively rendering frames
     if (!g_ctx.is_ready && !g_ctx.is_loading && frame > 60) {
         g_ctx.is_loading = true;
+        g_ctx.d3d12Device = reinterpret_cast<ID3D12Device*>(swapchain->get_device()->get_native());
         std::thread initThread(AsyncInitDirectML);
         initThread.detach();
     }
 
-    // Paced execution: alternate frames, non-blocking lock
     if (g_ctx.is_ready && (frame % 2 == 0)) {
         bool expected = false;
         if (g_isInferring.compare_exchange_strong(expected, true)) {
-            OrtStatus* status = g_ctx.ort->RunWithBinding(g_ctx.session, g_ctx.runOptions, g_ctx.ioBinding);
+            OrtValue* outputs[1] = { nullptr };
+            OrtStatus* status = g_ctx.ort->Run(
+                g_ctx.session,
+                nullptr,
+                g_ctx.inputNames,
+                (const OrtValue* const*)&g_ctx.inTensor,
+                1,
+                g_ctx.outputNames,
+                1,
+                outputs
+            );
+
             if (status != nullptr) {
                 if (g_ctx.logFile.is_open()) {
-                    g_ctx.logFile << "[NeuralShader] Error during RunWithBinding: " << g_ctx.ort->GetErrorMessage(status) << "\n";
+                    g_ctx.logFile << "[NeuralShader] Error during Run: " << g_ctx.ort->GetErrorMessage(status) << "\n";
                     g_ctx.logFile.flush();
                 }
                 g_ctx.ort->ReleaseStatus(status);
+                g_ctx.has_failed = true;
             } else {
+                if (outputs[0] != nullptr) {
+                    g_ctx.ort->ReleaseValue(outputs[0]);
+                }
                 uint64_t aiCount = ++g_ctx.ai_frames;
                 if (aiCount % 60 == 0 && g_ctx.logFile.is_open()) {
                     g_ctx.logFile << "[NeuralShader] Inferred AI frames: " << aiCount << " (Game frame: " << frame << ")\n";
@@ -165,8 +189,8 @@ static void on_present(reshade::api::command_queue*, reshade::api::swapchain* sw
     }
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (Isolated DirectML)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Queue-Isolated DirectML Addon for Forza Horizon 2";
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (GTX 1650 Dedicated)";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "Dedicated Queue DirectML Addon for Forza Horizon 2";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
@@ -181,7 +205,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
 
         g_ctx.logFile.open("neural_shader_debug.txt", std::ios::out);
         if (g_ctx.logFile.is_open()) {
-            g_ctx.logFile << "[NeuralShader] Addon attached to Azimuth.\n";
+            g_ctx.logFile << "[NeuralShader] Addon attached.\n";
             g_ctx.logFile.flush();
         }
 
@@ -194,14 +218,12 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
         reshade::unregister_addon(hinstDLL);
 
         if (g_ctx.is_ready) {
-            if (g_ctx.ioBinding) g_ctx.ort->ReleaseIoBinding(g_ctx.ioBinding);
-            if (g_ctx.runOptions) g_ctx.ort->ReleaseRunOptions(g_ctx.runOptions);
             if (g_ctx.inTensor) g_ctx.ort->ReleaseValue(g_ctx.inTensor);
-            if (g_ctx.outTensor) g_ctx.ort->ReleaseValue(g_ctx.outTensor);
             if (g_ctx.memInfo) g_ctx.ort->ReleaseMemoryInfo(g_ctx.memInfo);
             if (g_ctx.session) g_ctx.ort->ReleaseSession(g_ctx.session);
             if (g_ctx.sessionOptions) g_ctx.ort->ReleaseSessionOptions(g_ctx.sessionOptions);
             if (g_ctx.env) g_ctx.ort->ReleaseEnv(g_ctx.env);
+            if (g_ctx.hDml) FreeLibrary(g_ctx.hDml);
         }
 
         if (g_ctx.logFile.is_open()) {
