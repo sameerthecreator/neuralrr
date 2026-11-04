@@ -4,7 +4,6 @@
 #include <Windows.h>
 #include <vector>
 #include <algorithm>
-#include <imgui.h>
 
 static Ort::Env* g_ort_env = nullptr;
 static Ort::Session* g_ort_session = nullptr;
@@ -12,10 +11,6 @@ static Ort::MemoryInfo* g_memory_info = nullptr;
 
 static reshade::api::resource g_staging_read = {0};
 static reshade::api::resource g_staging_write = {0};
-
-// UI Parameters
-static bool g_enable_shader = true;
-static float g_blend_intensity = 1.0f;
 
 static void on_init_effect_runtime(reshade::api::effect_runtime* runtime) {
     if (g_ort_session) return;
@@ -42,14 +37,8 @@ static void on_destroy_effect_runtime(reshade::api::effect_runtime* runtime) {
     if (g_ort_env) { delete g_ort_env; g_ort_env = nullptr; }
 }
 
-// Draw the UI in the ReShade overlay
-static void on_draw_settings(reshade::api::effect_runtime* runtime) {
-    ImGui::Checkbox("Enable ONNX Shader", &g_enable_shader);
-    ImGui::SliderFloat("Blend Intensity", &g_blend_intensity, 0.0f, 1.0f);
-}
-
 static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
-    if (!g_ort_session || !g_enable_shader) return;
+    if (!g_ort_session) return;
 
     reshade::api::device* device = queue->get_device();
     reshade::api::command_list* cmd_list = queue->get_immediate_command_list();
@@ -71,7 +60,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         device->create_resource(stage_desc, nullptr, reshade::api::resource_usage::copy_source, &g_staging_write);
     }
 
-    // Use cmd_list to copy resources instead of queue
     cmd_list->copy_resource(backbuffer, g_staging_read);
     queue->wait_idle();
 
@@ -121,21 +109,13 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         for (int x = 0; x < width; ++x) {
             int idx = y * width + x;
             
-            float r_orig = input_tensor_values[0 * plane_size + idx];
-            float g_orig = input_tensor_values[1 * plane_size + idx];
-            float b_orig = input_tensor_values[2 * plane_size + idx];
-
             float r_ai = std::clamp(output_tensor_values[0 * plane_size + idx], 0.0f, 1.0f);
             float g_ai = std::clamp(output_tensor_values[1 * plane_size + idx], 0.0f, 1.0f);
             float b_ai = std::clamp(output_tensor_values[2 * plane_size + idx], 0.0f, 1.0f);
             
-            float r_final = r_orig + (r_ai - r_orig) * g_blend_intensity;
-            float g_final = g_orig + (g_ai - g_orig) * g_blend_intensity;
-            float b_final = b_orig + (b_ai - b_orig) * g_blend_intensity;
-
-            uint32_t r_int = static_cast<uint32_t>(r_final * 1023.0f);
-            uint32_t g_int = static_cast<uint32_t>(g_final * 1023.0f);
-            uint32_t b_int = static_cast<uint32_t>(b_final * 1023.0f);
+            uint32_t r_int = static_cast<uint32_t>(r_ai * 1023.0f);
+            uint32_t g_int = static_cast<uint32_t>(g_ai * 1023.0f);
+            uint32_t b_int = static_cast<uint32_t>(b_ai * 1023.0f);
             uint32_t a_int = 3; 
             
             row[x] = r_int | (g_int << 10) | (b_int << 20) | (a_int << 30);
@@ -143,7 +123,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     }
     device->unmap_texture_region(g_staging_write, 0);
 
-    // Use cmd_list here too
     cmd_list->copy_resource(g_staging_write, backbuffer);
 }
 
@@ -157,16 +136,13 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
             reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
             reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
             reshade::register_event<reshade::addon_event::present>(on_present);
-            reshade::register_overlay("Neural Shader", on_draw_settings);
             break;
         case DLL_PROCESS_DETACH:
             reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
             reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
             reshade::unregister_event<reshade::addon_event::present>(on_present);
-            reshade::unregister_overlay("Neural Shader", on_draw_settings);
             reshade::unregister_addon(hModule);
             break;
-        
     }
     return TRUE;
 }
