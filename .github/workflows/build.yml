@@ -1,78 +1,43 @@
-name: Build ReShade Addon
+name: Build Neural Shader and Benchmark
 
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
 
 jobs:
-  build:
+  build-windows:
     runs-on: windows-latest
 
     steps:
-    - name: Checkout repository
+    - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Clone ReShade headers
-      uses: actions/checkout@v4
-      with:
-        repository: crosire/reshade
-        ref: v6.8.0
-        path: reshade_repo
-
-    - name: Download ONNX Runtime DirectML & DirectML Core
-      shell: pwsh
-      run: |
-        # 1. Download ONNX Runtime DirectML 1.19.2 (Supports IR Version 10)
-        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.19.2" -OutFile "ort_dml.zip"
-        Expand-Archive -Path "ort_dml.zip" -DestinationPath "ort_extracted"
-        
-        # 2. Download DirectML redistributable DLL package (1.15.1)
-        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.15.1" -OutFile "dml.zip"
-        Expand-Archive -Path "dml.zip" -DestinationPath "dml_extracted"
-        
-        # 3. Organize headers and libraries
-        New-Item -ItemType Directory -Force -Path "onnxruntime\include"
-        New-Item -ItemType Directory -Force -Path "onnxruntime\lib"
-        
-        Copy-Item -Path "ort_extracted\build\native\include\*" -Destination "onnxruntime\include" -Recurse
-        Copy-Item -Path "ort_extracted\runtimes\win-x64\native\*" -Destination "onnxruntime\lib" -Recurse
-        
-        Copy-Item -Path "dml_extracted\bin\x64-win\DirectML.dll" -Destination "onnxruntime\lib\DirectML.dll"
-        Copy-Item -Path "dml_extracted\bin\x64-win\DirectML.dll" -Destination ".\DirectML.dll"
-
-    - name: Set up MSVC environment
+    - name: Setup MSVC Environment
       uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: x64
 
-    - name: Compile ReShade Addon
-      shell: pwsh
+    - name: Configure CMake
+      run: >
+        cmake -B build
+        -DCMAKE_BUILD_TYPE=Release
+        -A x64
+
+    - name: Build Targets
+      run: cmake --build build --config Release --parallel
+
+    - name: Prepare Artifact Folder
+      shell: bash
       run: |
-        cl.exe /O2 /LD /EHsc /std:c++17 `
-          /Fe:neural_shader.dll `
-          main.cpp `
-          /I"." `
-          /I"reshade_repo\include" `
-          /I"onnxruntime\include" `
-          onnxruntime\lib\onnxruntime.lib `
-          user32.lib `
-          delayimp.lib `
-          /link /DELAYLOAD:onnxruntime.dll
+        mkdir -p dist
+        cp build/Release/neural_shader.addon64 dist/ || true
+        cp build/Release/d3d12_benchmark.exe dist/ || true
+        cp build/onnxruntime_dml/runtimes/win-x64/native/*.dll dist/ || true
 
-        Copy-Item -Path "onnxruntime\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
-
-    - name: Upload Artifacts
+    - name: Upload Build Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: d3d12-benchmark-build
-        path: |
-          build/Release/*.dll
-          build/Release/*.exe
-
-    - name: Upload compiled addon artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: neural_shader_addon
-        path: |
-        
-          neural_shader.dll
-          onnxruntime.dll
-          DirectML.dll
+        name: neural-shader-d3d12-benchmark
+        path: dist/*
+        if-no-files-found: error
