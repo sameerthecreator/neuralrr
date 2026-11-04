@@ -37,9 +37,11 @@ jobs:
         cl.exe /O2 /LD /EHsc /std:c++17 main.cpp `
           /I"." `
           /I"reshade_repo\include" `
+          /I"reshade_repo\deps\imgui" `
           /I"onnxruntime\include" `
           onnxruntime\lib\onnxruntime.lib `
-          /link /EXPORT:ReShadePluginInit /EXPORT:ReShadePluginUninstall `
+          delayimp.lib `
+          /link /DELAYLOAD:onnxruntime.dll /EXPORT:ReShadePluginInit /EXPORT:ReShadePluginUninstall `
           /Fe:neural_shader.dll
 
         Copy-Item -Path "onnxruntime\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
