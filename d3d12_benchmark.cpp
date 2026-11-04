@@ -9,7 +9,6 @@
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "onnxruntime.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -44,19 +43,21 @@ ComPtr<ID3D12Resource> CreateD3D12Buffer(ID3D12Device* device, size_t sizeBytes)
     );
 
     if (FAILED(hr)) {
-        std::cerr << "Failed to allocate D3D12 buffer of size " << sizeBytes << " bytes\n";
+        std::cerr << "Failed to allocate D3D12 buffer: " << sizeBytes << " bytes\n";
         return nullptr;
     }
     return resource;
 }
 
 int main() {
-    std::cout << "====================================================\n";
+    std::cout << "========================================================\n";
     std::cout << " DirectML D3D12 Zero-Copy Inference Benchmark\n";
-    std::cout << " Target: 1920x1080 FP32 (7 Channels In -> 3 Out)\n";
-    std::cout << "====================================================\n\n";
+    std::cout << " Model   : neural_shader_gtx1650_sharp.onnx\n";
+    std::cout << " Shape   : [1, 7, 1080, 1920] -> [1, 3, 1080, 1920]\n";
+    std::cout << " Hardware: Native GPU VRAM (Zero Host Copying)\n";
+    std::cout << "========================================================\n\n";
 
-    // 1. Initialize DXGI and D3D12 Device on discrete GPU (GTX 1650)
+    // 1. Initialize DXGI and D3D12 on discrete GPU (GTX 1650)
     ComPtr<IDXGIFactory4> factory;
     CreateDXGIFactory1(IID_PPV_ARGS(&factory));
 
@@ -75,11 +76,11 @@ int main() {
     }
 
     if (!device) {
-        std::cerr << "Could not create D3D12 device.\n";
+        std::cerr << "Error: Could not create D3D12 device.\n";
         return -1;
     }
 
-    // 2. Allocate VRAM Buffers (Pure GPU memory, zero host RAM overhead)
+    // 2. Allocate VRAM Buffers in GPU Default Heap
     size_t inBytes = (size_t)WIDTH * HEIGHT * IN_CHANNELS * sizeof(float);
     size_t outBytes = (size_t)WIDTH * HEIGHT * OUT_CHANNELS * sizeof(float);
 
@@ -91,24 +92,24 @@ int main() {
 
     if (!inBuffer || !outBuffer) return -1;
 
-    // 3. Setup ONNX Runtime with DirectML
+    // 3. Initialize ONNX Runtime with DirectML
     const OrtApi& ortApi = Ort::GetApi();
     const OrtDmlApi* ortDmlApi = nullptr;
     ortApi.GetExecutionProviderApi("DML", ORT_API_VERSION, reinterpret_cast<const void**>(&ortDmlApi));
 
     if (!ortDmlApi) {
-        std::cerr << "Failed to fetch OrtDmlApi.\n";
+        std::cerr << "Error: DirectML execution provider API unavailable.\n";
         return -1;
     }
 
-    Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "ZeroCopyBenchmark");
+    Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "DirectML_Benchmark");
     Ort::SessionOptions sessionOptions;
     sessionOptions.SetIntraOpNumThreads(4);
     sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
     OrtSessionOptionsAppendExecutionProvider_DML(sessionOptions, 0);
 
     const wchar_t* modelPath = L"neural_shader_gtx1650_sharp.onnx";
-    std::cout << "Loading ONNX model into DirectML...\n";
+    std::cout << "Loading ONNX model graph into DirectML...\n";
     Ort::Session session(nullptr);
     try {
         session = Ort::Session(env, modelPath, sessionOptions);
@@ -118,7 +119,7 @@ int main() {
     }
     std::cout << "Model loaded successfully!\n\n";
 
-    // 4. Wrap D3D12 Resources into DirectML Tensors (Zero-Copy)
+    // 4. Wrap D3D12 VRAM Resources into DirectML Tensors (Zero-Copy)
     void* dmlInAlloc = nullptr;
     void* dmlOutAlloc = nullptr;
     ortDmlApi->CreateGPUAllocationFromD3DResource(inBuffer.Get(), &dmlInAlloc);
@@ -128,39 +129,47 @@ int main() {
     ortApi.CreateMemoryInfo("DML", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemType::OrtMemTypeDefault, &dmlMemInfo);
 
     int64_t inShape[] = { 1, IN_CHANNELS, HEIGHT, WIDTH };
-    OrtValue* inTensor = nullptr;
+    OrtValue* rawInVal = nullptr;
     ortApi.CreateTensorWithDataAsOrtValue(
         dmlMemInfo, dmlInAlloc, inBytes, inShape, 4,
-        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &inTensor
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &rawInVal
     );
 
     int64_t outShape[] = { 1, OUT_CHANNELS, HEIGHT, WIDTH };
-    OrtValue* outTensor = nullptr;
+    OrtValue* rawOutVal = nullptr;
     ortApi.CreateTensorWithDataAsOrtValue(
         dmlMemInfo, dmlOutAlloc, outBytes, outShape, 4,
-        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &outTensor
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &rawOutVal
     );
 
-    const char* inNames[] = { "g_buffer" };
-    const char* outNames[] = { "rendered_frame" };
+    // Wrap raw handles into C++ Ort::Value instances
+    Ort::Value inTensor(rawInVal);
+    Ort::Value outTensor(rawOutVal);
 
-    // 5. Warmup Run
-    std::cout << "Warming up DirectML execution graph...\n";
+    // 5. Setup IOBinding (Locks tensors to DirectML GPU queue)
+    Ort::IoBinding ioBinding(session);
+    ioBinding.BindInput("g_buffer", inTensor);
+    ioBinding.BindOutput("rendered_frame", outTensor);
+
+    Ort::RunOptions runOptions;
+
+    // 6. Warmup Run (Compiles the DirectML kernel execution plans on GPU)
+    std::cout << "Warming up DirectML pipeline on GPU...\n";
     try {
-        session.Run(Ort::RunOptions{ nullptr }, inNames, &inTensor, 1, outNames, &outTensor, 1);
+        session.Run(runOptions, ioBinding);
     } catch (const Ort::Exception& e) {
-        std::cerr << "Execution failed: " << e.what() << "\n";
+        std::cerr << "Warmup error: " << e.what() << "\n";
         return -1;
     }
     std::cout << "Warmup successful!\n\n";
 
-    // 6. Benchmark 50 Iterations
-    std::cout << "Running 50 iterations pure GPU-to-GPU inference...\n";
+    // 7. Benchmark 50 Sequential Executions
+    std::cout << "Benchmarking 50 frames of GPU-to-GPU inference...\n";
     auto start = std::chrono::high_resolution_clock::now();
 
     const int iterations = 50;
     for (int i = 0; i < iterations; ++i) {
-        session.Run(Ort::RunOptions{ nullptr }, inNames, &inTensor, 1, outNames, &outTensor, 1);
+        session.Run(runOptions, ioBinding);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -173,9 +182,7 @@ int main() {
     std::cout << "Maximum Potential FPS:  " << fps << " FPS\n";
     std::cout << "====================================================\n\n";
 
-    // Cleanup
-    ortApi.ReleaseValue(inTensor);
-    ortApi.ReleaseValue(outTensor);
+    // Cleanup allocations
     ortApi.ReleaseMemoryInfo(dmlMemInfo);
     ortDmlApi->FreeGPUAllocation(dmlInAlloc);
     ortDmlApi->FreeGPUAllocation(dmlOutAlloc);
