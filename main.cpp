@@ -24,6 +24,9 @@ constexpr int IN_HEIGHT    = 432;
 constexpr int IN_CHANNELS  = 7;
 constexpr int OUT_CHANNELS = 3;
 
+typedef const OrtApiBase* (ORT_API_CALL *PFN_OrtGetApiBase)(void);
+typedef OrtStatus* (ORT_API_CALL *PFN_OrtSessionOptionsAppendExecutionProvider_DML)(OrtSessionOptions* options, int device_id);
+
 struct NeuralState {
     std::atomic<bool> ready{false};
     std::atomic<bool> initializing{false};
@@ -35,7 +38,10 @@ struct NeuralState {
     std::atomic<uint64_t> ai_count{0};
     std::atomic<float> last_ai_ms{0.0f};
 
+    HMODULE hOrt = nullptr;
     const OrtApi* ort = nullptr;
+    PFN_OrtSessionOptionsAppendExecutionProvider_DML pfnAppendDml = nullptr;
+
     OrtEnv* env = nullptr;
     OrtSessionOptions* sessionOptions = nullptr;
     OrtSession* session = nullptr;
@@ -64,18 +70,37 @@ static void CleanupORT() {
     if (g_st.session && g_st.ort)  { g_st.ort->ReleaseSession(g_st.session); g_st.session = nullptr; }
     if (g_st.sessionOptions && g_st.ort) { g_st.ort->ReleaseSessionOptions(g_st.sessionOptions); g_st.sessionOptions = nullptr; }
     if (g_st.env && g_st.ort)      { g_st.ort->ReleaseEnv(g_st.env); g_st.env = nullptr; }
+    if (g_st.hOrt)                 { FreeLibrary(g_st.hOrt); g_st.hOrt = nullptr; }
 }
 
 static void InitDirectMLWorker() {
     if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] Initializing DirectML worker...\n";
+        g_st.log << "[NeuralShader] Dynamically loading onnxruntime.dll...\n";
         g_st.log.flush();
     }
 
-    const OrtApiBase* apiBase = OrtGetApiBase();
+    g_st.hOrt = LoadLibraryA("onnxruntime.dll");
+    if (!g_st.hOrt) {
+        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to load onnxruntime.dll\n";
+        g_st.failed = true;
+        return;
+    }
+
+    auto pfnGetApiBase = reinterpret_cast<PFN_OrtGetApiBase>(GetProcAddress(g_st.hOrt, "OrtGetApiBase"));
+    if (!pfnGetApiBase) {
+        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to find OrtGetApiBase in DLL\n";
+        g_st.failed = true;
+        return;
+    }
+
+    g_st.pfnAppendDml = reinterpret_cast<PFN_OrtSessionOptionsAppendExecutionProvider_DML>(
+        GetProcAddress(g_st.hOrt, "OrtSessionOptionsAppendExecutionProvider_DML")
+    );
+
+    const OrtApiBase* apiBase = pfnGetApiBase();
     g_st.ort = apiBase->GetApi(17);
     if (!g_st.ort) {
-        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to get OrtApi v17\n";
+        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to get OrtApi version 17\n";
         g_st.failed = true;
         return;
     }
@@ -86,15 +111,14 @@ static void InitDirectMLWorker() {
     g_st.ort->SetSessionGraphOptimizationLevel(g_st.sessionOptions, ORT_ENABLE_BASIC);
 
     SetEnvironmentVariableA("DML_DISABLE_METACMDS", "1");
-    OrtSessionOptionsAppendExecutionProvider_DML(g_st.sessionOptions, 0);
+    if (g_st.pfnAppendDml) {
+        g_st.pfnAppendDml(g_st.sessionOptions, 0);
+    }
 
     std::wstring modelPath = g_st.moduleDir + L"\\neural_shader_gtx1650_432p.onnx";
     std::ifstream file(modelPath, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
-        if (g_st.log.is_open()) {
-            g_st.log << "[NeuralShader] ERROR: Could not open model file: neural_shader_gtx1650_432p.onnx\n";
-            g_st.log.flush();
-        }
+        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Could not open neural_shader_gtx1650_432p.onnx\n";
         g_st.failed = true;
         return;
     }
@@ -103,7 +127,7 @@ static void InitDirectMLWorker() {
     file.seekg(0, std::ios::beg);
     g_st.modelBytes.resize(size);
     if (!file.read(g_st.modelBytes.data(), size)) {
-        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to read model bytes.\n";
+        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to read model file\n";
         g_st.failed = true;
         return;
     }
@@ -139,7 +163,7 @@ static void InitDirectMLWorker() {
     );
 
     if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] DirectML active on GTX 1650! Inference loop ready.\n";
+        g_st.log << "[NeuralShader] DirectML active on GTX 1650! Displaying AI rendered frames.\n";
         g_st.log.flush();
     }
 
@@ -151,14 +175,13 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
 
     uint64_t current_frame = ++g_st.frame_count;
 
-    // Trigger initialization after passing frame 120
     if (!g_st.ready && !g_st.initializing && current_frame > 120) {
         g_st.initializing = true;
         std::thread(InitDirectMLWorker).detach();
         return;
     }
 
-    // Lazy create screen texture for AI frames on the swapchain device
+    // Lazy create RGBA8 texture for model frames
     if (g_st.ready && g_st.aiTextureRes.handle == 0 && swapchain != nullptr) {
         auto device = swapchain->get_device();
         reshade::api::resource_desc desc = {};
@@ -174,7 +197,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         device->create_resource(desc, nullptr, reshade::api::resource_usage::copy_dest, &g_st.aiTextureRes);
     }
 
-    // Run inference every 2nd frame
     if (g_st.ready && (current_frame % 2 == 0)) {
         bool expected = false;
         if (g_st.running.compare_exchange_strong(expected, true)) {
@@ -231,7 +253,7 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
                 uint64_t ai = ++g_st.ai_count;
                 if (ai % 60 == 0) {
                     char titleBuf[128];
-                    snprintf(titleBuf, sizeof(titleBuf), "Forza Horizon 2 [AI Output: %llu Frames | %.1f ms]", (unsigned long long)ai, ms);
+                    snprintf(titleBuf, sizeof(titleBuf), "Forza Horizon 2 [AI Frames: %llu | %.1f ms]", (unsigned long long)ai, ms);
                     SetConsoleTitleA(titleBuf);
 
                     if (g_st.log.is_open()) {
@@ -244,12 +266,11 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         }
     }
 
-    // Display the model's output directly on screen
+    // Paint the model's actual rendered frame onto the backbuffer
     if (g_st.has_new_frame.load() && g_st.aiTextureRes.handle != 0 && swapchain != nullptr && queue != nullptr) {
         auto device = swapchain->get_device();
         auto cmdList = queue->get_immediate_command_list();
 
-        // 1. Upload the AI pixels to the GPU texture
         reshade::api::subresource_data subData = {};
         subData.data = g_st.pixelBufferRGBA.data();
         subData.row_pitch = IN_WIDTH * 4;
@@ -257,7 +278,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
 
         device->update_texture_region(subData, g_st.aiTextureRes, 0, nullptr);
 
-        // 2. Blit the AI frame over the active backbuffer
         reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
         if (cmdList != nullptr && backbuffer.handle != 0) {
             reshade::api::subresource_box srcBox = {};
@@ -278,7 +298,7 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
 }
 
 extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (AI Screen Output)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML Runtime Displaying AI Rendered Frames";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML Runtime Displaying AI Frames";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
@@ -291,7 +311,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
 
         g_st.log.open("neural_shader_debug.txt", std::ios::out);
         if (g_st.log.is_open()) {
-            g_st.log << "[NeuralShader] Addon loaded.\n";
+            g_st.log << "[NeuralShader] Addon attached.\n";
             g_st.log.flush();
         }
 
@@ -304,7 +324,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
         reshade::unregister_addon(hinstDLL);
         CleanupORT();
         if (g_st.log.is_open()) {
-            g_st.log << "[NeuralShader] Addon unloaded cleanly.\n";
+            g_st.log << "[NeuralShader] Addon detached.\n";
             g_st.log.close();
         }
         break;
