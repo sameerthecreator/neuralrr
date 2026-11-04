@@ -45,8 +45,6 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool) {
         Ort::SessionOptions session_options;
         session_options.SetIntraOpNumThreads(4);
         session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
-
-        // Bind DirectML GPU Execution Provider
         OrtSessionOptionsAppendExecutionProvider_DML(session_options, 0);
 
         std::wstring model_full_path = get_addon_directory() + L"neural_shader_gtx1650_sharp.onnx";
@@ -58,9 +56,6 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain, bool) {
 
         log_debug("ONNX Session created successfully.");
         MessageBeep(MB_ICONASTERISK);
-    } catch (const Ort::Exception& oe) {
-        log_debug(std::string("Ort Init Exception: ") + oe.what());
-        MessageBeep(MB_ICONHAND);
     } catch (const std::exception& e) {
         log_debug(std::string("Init Exception: ") + e.what());
         MessageBeep(MB_ICONHAND);
@@ -93,7 +88,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     if (GetAsyncKeyState(VK_F11) & 0x0001) {
         g_ai_multiplier = (std::min)(g_ai_multiplier + 0.5f, 6.0f);
         MessageBeep(MB_OK);
-        log_debug(std::string("Multiplier bumped to: ") + std::to_string(g_ai_multiplier));
     }
     if (GetAsyncKeyState(VK_F9) & 0x0001) {
         g_ai_multiplier = (std::max)(g_ai_multiplier - 0.5f, 0.1f);
@@ -123,7 +117,7 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     bool is_10bit = (fmt == reshade::api::format::r10g10b10a2_unorm || fmt == reshade::api::format::b10g10r10a2_unorm);
     bool is_bgra = (fmt == reshade::api::format::b8g8r8a8_unorm || fmt == reshade::api::format::b8g8r8a8_unorm_srgb || fmt == reshade::api::format::b10g10r10a2_unorm);
 
-    // Staging resources allocation
+    // Staging allocations
     if (g_staging_color_read.handle == 0 || device->get_resource_desc(g_staging_color_read).texture.width != width) {
         if (g_staging_color_read.handle != 0) {
             device->destroy_resource(g_staging_color_read);
@@ -146,8 +140,12 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     reshade::api::command_list* cmd_list = queue->get_immediate_command_list();
     if (!cmd_list) return;
 
-    // Copy frame to read staging buffer
+    // Transition backbuffer to COPY_SOURCE for reading
+    cmd_list->barrier(backbuffer, reshade::api::resource_usage::present, reshade::api::resource_usage::copy_source);
     cmd_list->copy_resource(backbuffer, g_staging_color_read);
+    // Transition backbuffer back for staging
+    cmd_list->barrier(backbuffer, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::copy_dest);
+
     queue->wait_idle();
 
     reshade::api::subresource_data mapped_color;
@@ -185,10 +183,10 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
             input_tensor[0 * plane_size + idx] = r;
             input_tensor[1 * plane_size + idx] = g;
             input_tensor[2 * plane_size + idx] = b;
-            input_tensor[3 * plane_size + idx] = 0.5f; // depth baseline
-            input_tensor[4 * plane_size + idx] = 0.5f; // normal x
-            input_tensor[5 * plane_size + idx] = 0.5f; // normal y
-            input_tensor[6 * plane_size + idx] = 1.0f; // normal z
+            input_tensor[3 * plane_size + idx] = 0.5f;
+            input_tensor[4 * plane_size + idx] = 0.5f;
+            input_tensor[5 * plane_size + idx] = 0.5f;
+            input_tensor[6 * plane_size + idx] = 1.0f;
         }
     }
     device->unmap_texture_region(g_staging_color_read, 0);
@@ -206,13 +204,9 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
             input_names, &input_tensor_val, 1,
             output_names, 1
         );
-    } catch (const Ort::Exception& oe) {
-        static int err_cnt = 0;
-        if (err_cnt++ < 3) log_debug(std::string("Ort::Run error: ") + oe.what());
-        return;
     } catch (const std::exception& e) {
-        static int err_cnt2 = 0;
-        if (err_cnt2++ < 3) log_debug(std::string("Run error: ") + e.what());
+        static int err_cnt = 0;
+        if (err_cnt++ < 3) log_debug(std::string("Ort::Run error: ") + e.what());
         return;
     }
 
@@ -237,9 +231,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
 
             float r_final, g_final, b_final;
 
-            // SPLIT-SCREEN COMPARISON:
-            // Left Half: Original Game Render
-            // Right Half: AI Neural Tonemapped
             if (x < half_width) {
                 r_final = r_orig;
                 g_final = g_orig;
@@ -254,8 +245,8 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
                 b_final = std::clamp(b_orig + (b_ai - b_orig) * g_ai_multiplier, 0.0f, 1.0f);
             }
 
-            // Draw a 2-pixel white divider line down the middle
-            if (std::abs(x - half_width) <= 1) {
+            // High-visibility 4-pixel divider line down the middle
+            if (std::abs(x - half_width) <= 2) {
                 r_final = 1.0f; g_final = 1.0f; b_final = 1.0f;
             }
 
@@ -285,8 +276,9 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     }
     device->unmap_texture_region(g_staging_color_write, 0);
 
-    // Blit directly into the active presenting buffer
+    // Copy modified frame onto backbuffer and transition back to PRESENT
     cmd_list->copy_resource(g_staging_color_write, backbuffer);
+    cmd_list->barrier(backbuffer, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::present);
 }
 
 extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (HDR2SDR)";
