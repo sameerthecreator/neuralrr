@@ -11,13 +11,13 @@
 #include <chrono>
 #include <atomic>
 #include <mutex>
+#include <string>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 
 using Microsoft::WRL::ComPtr;
 
-// Target dimensions calibrated for GTX 1650 (32.7 ms per frame budget)
 constexpr int IN_WIDTH       = 768;
 constexpr int IN_HEIGHT      = 432;
 constexpr int IN_CHANNELS    = 7;
@@ -31,8 +31,9 @@ typedef HRESULT (WINAPI* PFN_DMLCreateDevice)(
 );
 
 struct NeuralPipelineContext {
-    bool initialized = false;
-    bool failed = false;
+    std::atomic<bool> initialized{false};
+    std::atomic<bool> failed{false};
+    std::atomic<uint64_t> frameCount{0};
 
     // D3D12 Hardware state
     ComPtr<ID3D12Device> d3d12Device;
@@ -64,12 +65,13 @@ struct NeuralPipelineContext {
     OrtValue* outTensor = nullptr;
     OrtIoBinding* ioBinding = nullptr;
     OrtRunOptions* runOptions = nullptr;
+
+    std::wstring modelDirectory;
 };
 
 static NeuralPipelineContext g_ctx;
 static std::mutex g_pipelineMutex;
 
-// Helper to allocate zero-copy DirectML default GPU heap buffers
 static ComPtr<ID3D12Resource> CreateLinearBuffer(ID3D12Device* device, size_t sizeBytes) {
     D3D12_HEAP_PROPERTIES heapProps = {};
     heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -110,7 +112,7 @@ static bool InitNeuralPipeline(ID3D12Device* device, ID3D12CommandQueue* queue) 
 
     if (FAILED(pfnDMLCreateDevice(device, DML_CREATE_DEVICE_FLAG_NONE, IID_PPV_ARGS(&g_ctx.dmlDevice)))) return false;
 
-    // 2. Allocate VRAM Tensors for 768x432 (Zero-Copy)
+    // 2. Allocate VRAM Tensors for 768x432
     size_t inBytes  = (size_t)IN_WIDTH * IN_HEIGHT * IN_CHANNELS * sizeof(float);
     size_t outBytes = (size_t)IN_WIDTH * IN_HEIGHT * OUT_CHANNELS * sizeof(float);
 
@@ -118,7 +120,7 @@ static bool InitNeuralPipeline(ID3D12Device* device, ID3D12CommandQueue* queue) 
     g_ctx.outBuffer = CreateLinearBuffer(device, outBytes);
     if (!g_ctx.inBuffer || !g_ctx.outBuffer) return false;
 
-    // Transition buffers to UNORDERED_ACCESS state
+    // Transition buffers to UNORDERED_ACCESS
     D3D12_RESOURCE_BARRIER barriers[2] = {};
     barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barriers[0].Transition.pResource = g_ctx.inBuffer.Get();
@@ -137,13 +139,12 @@ static bool InitNeuralPipeline(ID3D12Device* device, ID3D12CommandQueue* queue) 
     ID3D12CommandList* lists[] = { g_ctx.cmdList.Get() };
     g_ctx.cmdQueue->ExecuteCommandLists(1, lists);
 
-    // Wait for state transition
     g_ctx.fenceValue++;
     g_ctx.cmdQueue->Signal(g_ctx.fence.Get(), g_ctx.fenceValue);
     g_ctx.fence->SetEventOnCompletion(g_ctx.fenceValue, g_ctx.fenceEvent);
-    WaitForSingleObject(g_ctx.fenceEvent, INFINITE);
+    WaitForSingleObject(g_ctx.fenceEvent, 2000);
 
-    // 3. Connect ORT Session (API Version 17)
+    // 3. Initialize ORT Session
     const OrtApiBase* apiBase = OrtGetApiBase();
     g_ctx.ort = apiBase->GetApi(17);
     if (!g_ctx.ort) return false;
@@ -156,17 +157,17 @@ static bool InitNeuralPipeline(ID3D12Device* device, ID3D12CommandQueue* queue) 
     g_ctx.ort->SetIntraOpNumThreads(g_ctx.sessionOptions, 4);
     g_ctx.ort->SetSessionGraphOptimizationLevel(g_ctx.sessionOptions, ORT_ENABLE_EXTENDED);
 
-    // Connect to DML execution provider with our command queue
     g_ctx.ortDml->SessionOptionsAppendExecutionProvider_DML1(g_ctx.sessionOptions, g_ctx.dmlDevice.Get(), g_ctx.cmdQueue.Get());
 
-    const wchar_t* modelPath = L"neural_shader_gtx1650_432p.onnx";
-    OrtStatus* status = g_ctx.ort->CreateSession(g_ctx.env, modelPath, g_ctx.sessionOptions, &g_ctx.session);
+    // Resolve full absolute path to the ONNX model
+    std::wstring fullModelPath = g_ctx.modelDirectory + L"\\neural_shader_gtx1650_432p.onnx";
+    OrtStatus* status = g_ctx.ort->CreateSession(g_ctx.env, fullModelPath.c_str(), g_ctx.sessionOptions, &g_ctx.session);
     if (status != nullptr) {
         g_ctx.ort->ReleaseStatus(status);
         return false;
     }
 
-    // 4. Bind Zero-Copy D3D12 VRAM Allocations to ORT Values
+    // 4. Bind GPU Allocations
     g_ctx.ortDml->CreateGPUAllocationFromD3DResource(g_ctx.inBuffer.Get(), &g_ctx.dmlInAlloc);
     g_ctx.ortDml->CreateGPUAllocationFromD3DResource(g_ctx.outBuffer.Get(), &g_ctx.dmlOutAlloc);
 
@@ -187,13 +188,16 @@ static bool InitNeuralPipeline(ID3D12Device* device, ID3D12CommandQueue* queue) 
     return true;
 }
 
-// ReShade on_present callback: Called right before backbuffer is presented to display
 static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
     if (g_ctx.failed) return;
-
     if (swapchain->get_device()->get_api() != reshade::api::device_api::d3d12) return;
 
-    std::lock_guard<std::mutex> lock(g_pipelineMutex);
+    // Bypass splash screens / initial loading stubs (let first 60 frames present cleanly)
+    uint64_t frame = ++g_ctx.frameCount;
+    if (frame < 60) return;
+
+    std::unique_lock<std::mutex> lock(g_pipelineMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
 
     ID3D12Device* d3d12Device = reinterpret_cast<ID3D12Device*>(swapchain->get_device()->get_native());
     ID3D12CommandQueue* d3d12Queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
@@ -205,23 +209,30 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         }
     }
 
-    // Execute neural inference on current frame
     OrtStatus* status = g_ctx.ort->RunWithBinding(g_ctx.session, g_ctx.runOptions, g_ctx.ioBinding);
     if (status != nullptr) {
         g_ctx.ort->ReleaseStatus(status);
     }
 }
 
-// ReShade Addon Lifecycle
 extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (DirectML Zero-Copy)";
 extern "C" __declspec(dllexport) const char* DESCRIPTION = "Real-time AI Frame Enhancement for FH2/Azimuth on GTX 1650 (768x432 Pipeline)";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
-    case DLL_PROCESS_ATTACH:
+    case DLL_PROCESS_ATTACH: {
+        wchar_t modulePath[MAX_PATH];
+        GetModuleFileNameW(hinstDLL, modulePath, MAX_PATH);
+        std::wstring pathStr(modulePath);
+        size_t lastSlash = pathStr.find_last_of(L"\\/");
+        if (lastSlash != std::wstring::npos) {
+            g_ctx.modelDirectory = pathStr.substr(0, lastSlash);
+        }
+
         if (!reshade::register_addon(hinstDLL)) return FALSE;
         reshade::register_event<reshade::addon_event::present>(on_present);
         break;
+    }
     case DLL_PROCESS_DETACH:
         reshade::unregister_event<reshade::addon_event::present>(on_present);
         reshade::unregister_addon(hinstDLL);
