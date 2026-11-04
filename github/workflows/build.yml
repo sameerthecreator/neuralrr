@@ -22,12 +22,14 @@ jobs:
         Expand-Archive -Path "onnxruntime.zip" -DestinationPath "."
         Rename-Item "onnxruntime-win-x64-1.16.1" "onnxruntime"
 
-    - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v3
+    - name: Set up MSVC Developer Command Prompt
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: x64
 
-    - name: Compile via Visual Studio MSBuild Compiler
+    - name: Compile ReShade Add-on DLL
       run: |
-        cmd.exe /c "\"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat\" x64 && cl.exe /LD main.cpp /I"." /I"reshade_repo\include" /I"onnxruntime\include" onnxruntime\lib\onnxruntime.lib /Fe:neural_shader.dll"
+        cl.exe /O2 /LD /EHsc /std:c++17 main.cpp /I"." /I"reshade_repo\include" /I"onnxruntime\include" onnxruntime\lib\onnxruntime.lib /Fe:neural_shader.dll
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
@@ -35,4 +37,4 @@ jobs:
         name: neural_shader_addon
         path: |
           neural_shader.dll
-          onnxruntime.dll
+          onnxruntime\lib\onnxruntime.dll
