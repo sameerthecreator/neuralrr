@@ -1,44 +1,4 @@
-name: Build ReShade Addon
-
-on:
-  push:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: windows-latest
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
-
-    - name: Clone ReShade headers
-      uses: actions/checkout@v4
-      with:
-        repository: crosire/reshade
-        ref: v6.8.0
-        path: reshade_repo
-
-    - name: Download ONNX Runtime DirectML
-      shell: pwsh
-      run: |
-        # Download the official Microsoft.ML.OnnxRuntime.DirectML NuGet package
-        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.16.3" -OutFile "onnxruntime.zip"
-        Expand-Archive -Path "onnxruntime.zip" -DestinationPath "nuget_extracted"
-        
-        # Organize into standard onnxruntime include and lib folders
-        New-Item -ItemType Directory -Force -Path "onnxruntime\include"
-        New-Item -ItemType Directory -Force -Path "onnxruntime\lib"
-        
-        Copy-Item -Path "nuget_extracted\build\native\include\*" -Destination "onnxruntime\include" -Recurse
-        Copy-Item -Path "nuget_extracted\runtimes\win-x64\native\*" -Destination "onnxruntime\lib" -Recurse
-
-    - name: Set up MSVC environment
-      uses: ilammy/msvc-dev-cmd@v1
-      with:
-        arch: x64
-
-    - name: Compile ReShade Addon
+- name: Compile ReShade Addon
       shell: pwsh
       run: |
         cl.exe /O2 /LD /EHsc /std:c++17 `
@@ -48,6 +8,7 @@ jobs:
           /I"reshade_repo\include" `
           /I"onnxruntime\include" `
           onnxruntime\lib\onnxruntime.lib `
+          user32.lib `
           delayimp.lib `
           /link /DELAYLOAD:onnxruntime.dll
 
@@ -55,12 +16,3 @@ jobs:
         if (Test-Path "onnxruntime\lib\DirectML.dll") {
           Copy-Item -Path "onnxruntime\lib\DirectML.dll" -Destination ".\DirectML.dll"
         }
-
-    - name: Upload compiled addon artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: neural_shader_addon
-        path: |
-          neural_shader.dll
-          onnxruntime.dll
-          DirectML.dll
