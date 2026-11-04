@@ -10,7 +10,6 @@
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
-#pragma comment(lib, "DirectML.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -18,6 +17,13 @@ constexpr int WIDTH = 1920;
 constexpr int HEIGHT = 1080;
 constexpr int IN_CHANNELS = 7;
 constexpr int OUT_CHANNELS = 3;
+
+typedef HRESULT (WINAPI* PFN_DMLCreateDevice)(
+    ID3D12Device* d3d12Device,
+    DML_CREATE_DEVICE_FLAGS flags,
+    REFIID riid,
+    void** ppv
+);
 
 ComPtr<ID3D12Resource> CreateD3D12Buffer(ID3D12Device* device, size_t sizeBytes) {
     D3D12_HEAP_PROPERTIES heapProps = {};
@@ -96,9 +102,21 @@ int main() {
     ComPtr<ID3D12GraphicsCommandList> cmdList;
     device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, cmdAlloc.Get(), nullptr, IID_PPV_ARGS(&cmdList));
 
-    // 3. Create DirectML Device on top of D3D12 Device
+    // 3. Dynamically resolve DMLCreateDevice from DirectML.dll
+    HMODULE hDml = LoadLibraryA("DirectML.dll");
+    if (!hDml) {
+        std::cerr << "Error: Could not load DirectML.dll from directory.\n";
+        return -1;
+    }
+
+    auto pfnDMLCreateDevice = reinterpret_cast<PFN_DMLCreateDevice>(GetProcAddress(hDml, "DMLCreateDevice"));
+    if (!pfnDMLCreateDevice) {
+        std::cerr << "Error: Failed to find DMLCreateDevice inside DirectML.dll.\n";
+        return -1;
+    }
+
     ComPtr<IDMLDevice> dmlDevice;
-    HRESULT hr = DMLCreateDevice(device.Get(), DML_CREATE_DEVICE_FLAG_NONE, IID_PPV_ARGS(&dmlDevice));
+    HRESULT hr = pfnDMLCreateDevice(device.Get(), DML_CREATE_DEVICE_FLAG_NONE, IID_PPV_ARGS(&dmlDevice));
     if (FAILED(hr)) {
         std::cerr << "Error: DMLCreateDevice failed (HRESULT: 0x" << std::hex << hr << ")\n";
         return -1;
@@ -254,6 +272,9 @@ int main() {
     ort->ReleaseEnv(env);
     ortDmlApi->FreeGPUAllocation(dmlInAlloc);
     ortDmlApi->FreeGPUAllocation(dmlOutAlloc);
+    FreeLibrary(hDml);
 
+    std::cout << "Press Enter to exit...";
+    std::cin.get();
     return 0;
 }
