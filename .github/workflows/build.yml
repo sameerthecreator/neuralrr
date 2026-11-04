@@ -31,9 +31,7 @@ jobs:
       shell: bash
       run: |
         mkdir -p dist
-        cp build/Release/neural_shader.addon64 dist/ || true
-        cp build/Release/d3d12_benchmark.exe dist/ || true
-        cp build/onnxruntime_dml/runtimes/win-x64/native/*.dll dist/ || true
+        find build/ -type f \( -name "*.addon64" -o -name "d3d12_benchmark.exe" -o -name "*.dll" \) -exec cp {} dist/ \; || true
 
     - name: Upload Build Artifacts
       uses: actions/upload-artifact@v4
