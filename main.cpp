@@ -16,19 +16,10 @@
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 
-using Microsoft::WRL::ComPtr;
-
 constexpr int IN_WIDTH     = 768;
 constexpr int IN_HEIGHT    = 432;
 constexpr int IN_CHANNELS  = 7;
 constexpr int OUT_CHANNELS = 3;
-
-typedef HRESULT (WINAPI* PFN_DMLCreateDevice)(
-    ID3D12Device* d3d12Device,
-    DML_CREATE_DEVICE_FLAGS flags,
-    REFIID riid,
-    void** ppv
-);
 
 struct NeuralState {
     std::atomic<bool> ready{false};
@@ -40,13 +31,7 @@ struct NeuralState {
     std::atomic<uint64_t> ai_count{0};
     std::atomic<float> last_ai_ms{0.0f};
 
-    ComPtr<ID3D12Device> device;
-    ComPtr<ID3D12CommandQueue> queue;
-    HMODULE hDml = nullptr;
-    ComPtr<IDMLDevice> dmlDevice;
-
     const OrtApi* ort = nullptr;
-    const OrtDmlApi* ortDml = nullptr;
     OrtEnv* env = nullptr;
     OrtSessionOptions* sessionOptions = nullptr;
     OrtSession* session = nullptr;
@@ -57,6 +42,7 @@ struct NeuralState {
     const char* outputNames[1] = { "rendered_frame" };
 
     std::vector<float> inputData;
+    std::vector<char> modelBytes;
     std::wstring moduleDir;
     std::ofstream log;
 };
@@ -70,53 +56,18 @@ static void CleanupORT() {
     if (g_st.session && g_st.ort)  { g_st.ort->ReleaseSession(g_st.session); g_st.session = nullptr; }
     if (g_st.sessionOptions && g_st.ort) { g_st.ort->ReleaseSessionOptions(g_st.sessionOptions); g_st.sessionOptions = nullptr; }
     if (g_st.env && g_st.ort)      { g_st.ort->ReleaseEnv(g_st.env); g_st.env = nullptr; }
-    if (g_st.dmlDevice)            { g_st.dmlDevice.Reset(); }
-    if (g_st.queue)                { g_st.queue.Reset(); }
-    if (g_st.device)               { g_st.device.Reset(); }
-    if (g_st.hDml)                 { FreeLibrary(g_st.hDml); g_st.hDml = nullptr; }
 }
 
 static void InitDirectMLWorker() {
     if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] Worker thread initializing DirectML...\n";
+        g_st.log << "[NeuralShader] Step 1: Worker thread started.\n";
         g_st.log.flush();
     }
 
-    // 1. Create a dedicated Direct3D 12 queue for DirectML
-    D3D12_COMMAND_QUEUE_DESC qDesc = {};
-    qDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-    qDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
-    if (FAILED(g_st.device->CreateCommandQueue(&qDesc, IID_PPV_ARGS(&g_st.queue)))) {
-        if (g_st.log.is_open()) g_st.log << "[NeuralShader] Failed to create D3D12 queue\n";
-        g_st.failed = true;
-        return;
-    }
-
-    // 2. Load DirectML runtime
-    g_st.hDml = LoadLibraryA("DirectML.dll");
-    if (!g_st.hDml) {
-        if (g_st.log.is_open()) g_st.log << "[NeuralShader] Failed to load DirectML.dll\n";
-        g_st.failed = true;
-        return;
-    }
-
-    auto pfnDML = reinterpret_cast<PFN_DMLCreateDevice>(GetProcAddress(g_st.hDml, "DMLCreateDevice"));
-    if (!pfnDML || FAILED(pfnDML(g_st.device.Get(), DML_CREATE_DEVICE_FLAG_NONE, IID_PPV_ARGS(&g_st.dmlDevice)))) {
-        if (g_st.log.is_open()) g_st.log << "[NeuralShader] DMLCreateDevice failed\n";
-        g_st.failed = true;
-        return;
-    }
-
-    // 3. Setup ONNX Runtime
     const OrtApiBase* apiBase = OrtGetApiBase();
     g_st.ort = apiBase->GetApi(17);
     if (!g_st.ort) {
-        g_st.failed = true;
-        return;
-    }
-
-    g_st.ort->GetExecutionProviderApi("DML", 17, reinterpret_cast<const void**>(&g_st.ortDml));
-    if (!g_st.ortDml) {
+        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to get OrtApi v17\n";
         g_st.failed = true;
         return;
     }
@@ -127,13 +78,50 @@ static void InitDirectMLWorker() {
     g_st.ort->SetSessionGraphOptimizationLevel(g_st.sessionOptions, ORT_ENABLE_BASIC);
 
     SetEnvironmentVariableA("DML_DISABLE_METACMDS", "1");
-    g_st.ortDml->SessionOptionsAppendExecutionProvider_DML1(g_st.sessionOptions, g_st.dmlDevice.Get(), g_st.queue.Get());
+
+    if (g_st.log.is_open()) {
+        g_st.log << "[NeuralShader] Step 2: Appending DirectML execution provider...\n";
+        g_st.log.flush();
+    }
+
+    OrtSessionOptionsAppendExecutionProvider_DML(g_st.sessionOptions, 0);
 
     std::wstring modelPath = g_st.moduleDir + L"\\neural_shader_gtx1650_432p.onnx";
-    OrtStatus* status = g_st.ort->CreateSession(g_st.env, modelPath.c_str(), g_st.sessionOptions, &g_st.session);
+    std::ifstream file(modelPath, std::ios::binary | std::ios::ate);
+    if (!file.is_open()) {
+        if (g_st.log.is_open()) {
+            g_st.log << "[NeuralShader] ERROR: Could not open neural_shader_gtx1650_432p.onnx\n";
+            g_st.log.flush();
+        }
+        g_st.failed = true;
+        return;
+    }
+
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    g_st.modelBytes.resize(size);
+    if (!file.read(g_st.modelBytes.data(), size)) {
+        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to read model bytes.\n";
+        g_st.failed = true;
+        return;
+    }
+
+    if (g_st.log.is_open()) {
+        g_st.log << "[NeuralShader] Step 3: Compiling session from memory (" << size << " bytes)...\n";
+        g_st.log.flush();
+    }
+
+    OrtStatus* status = g_st.ort->CreateSessionFromArray(
+        g_st.env,
+        g_st.modelBytes.data(),
+        g_st.modelBytes.size(),
+        g_st.sessionOptions,
+        &g_st.session
+    );
+
     if (status != nullptr) {
         if (g_st.log.is_open()) {
-            g_st.log << "[NeuralShader] CreateSession failed: " << g_st.ort->GetErrorMessage(status) << "\n";
+            g_st.log << "[NeuralShader] ERROR: CreateSessionFromArray failed: " << g_st.ort->GetErrorMessage(status) << "\n";
             g_st.log.flush();
         }
         g_st.ort->ReleaseStatus(status);
@@ -141,7 +129,6 @@ static void InitDirectMLWorker() {
         return;
     }
 
-    // 4. Staging tensor
     size_t inElems = (size_t)IN_WIDTH * IN_HEIGHT * IN_CHANNELS;
     g_st.inputData.assign(inElems, 0.5f);
     g_st.ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &g_st.memInfo);
@@ -153,43 +140,24 @@ static void InitDirectMLWorker() {
     );
 
     if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] DirectML active on GTX 1650.\n";
+        g_st.log << "[NeuralShader] DirectML active on GTX 1650! Inference loop ready.\n";
         g_st.log.flush();
     }
 
     g_st.ready = true;
 }
 
-// Draw status and live frames onto ReShade's overlay menu
-static void on_draw_overlay(reshade::api::effect_runtime*) {
-    #if RESHADE_GUI
-    // If ReShade UI is enabled in this build
-    #endif
-}
-
-static void on_present(reshade::api::command_queue*, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
-    if (g_st.failed) return;
-
+static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
     uint64_t current_frame = ++g_st.frame_count;
 
-    // Acquire the active native D3D12 device directly from swapchain
-    if (!g_st.device && swapchain != nullptr) {
-        auto dev = swapchain->get_device();
-        if (dev != nullptr && dev->get_api() == reshade::api::device_api::d3d12) {
-            g_st.device = reinterpret_cast<ID3D12Device*>(dev->get_native());
-        }
-    }
-
-    if (!g_st.device) return;
-
-    // Once in gameplay past frame 120, spin up worker thread once
-    if (!g_st.ready && !g_st.initializing && current_frame > 120) {
+    // Trigger initialization after passing frame 120
+    if (!g_st.ready && !g_st.initializing && !g_st.failed && current_frame > 120) {
         g_st.initializing = true;
         std::thread(InitDirectMLWorker).detach();
         return;
     }
 
-    // Alternate-frame inference (30 FPS cadence)
+    // Run inference every 2nd frame
     if (g_st.ready && (current_frame % 2 == 0)) {
         bool expected = false;
         if (g_st.running.compare_exchange_strong(expected, true)) {
@@ -225,10 +193,9 @@ static void on_present(reshade::api::command_queue*, reshade::api::swapchain* sw
                 }
                 uint64_t ai = ++g_st.ai_count;
 
-                // Log every 60 frames and write to console title bar so you see it live
                 if (ai % 60 == 0) {
                     char titleBuf[128];
-                    snprintf(titleBuf, sizeof(titleBuf), "Forza Horizon 2 [Neural Shader: %llu AI Frames | %.1f ms]", ai, ms);
+                    snprintf(titleBuf, sizeof(titleBuf), "Forza Horizon 2 [AI: %llu Frames | %.1f ms]", (unsigned long long)ai, ms);
                     SetConsoleTitleA(titleBuf);
 
                     if (g_st.log.is_open()) {
@@ -240,10 +207,37 @@ static void on_present(reshade::api::command_queue*, reshade::api::swapchain* sw
             g_st.running.store(false);
         }
     }
+
+    // Screen Visual Effect: Render HUD indicator on top of active game frame
+    if (swapchain != nullptr && queue != nullptr) {
+        // If AI is actively running or has failed, draw an on-screen status rectangle
+        if (g_st.ready || g_st.failed) {
+            reshade::api::resource current_backbuffer = swapchain->get_current_back_buffer();
+            reshade::api::resource_view rtv = swapchain->get_device()->get_resource_view(current_backbuffer);
+
+            // Green/Cyan pulse when working normally, Solid Red if failed
+            float color[4];
+            if (g_st.failed) {
+                color[0] = 1.0f; color[1] = 0.0f; color[2] = 0.0f; color[3] = 1.0f; // Red
+            } else {
+                // Subtle pulse effect tied to AI frame count
+                float pulse = 0.6f + 0.4f * sinf(g_st.ai_count.load() * 0.1f);
+                color[0] = 0.0f; color[1] = pulse; color[2] = 0.8f * pulse; color[3] = 1.0f; // Neon Cyan/Green
+            }
+
+            // Top-left HUD box: (left: 20, top: 20, right: 220, bottom: 35)
+            reshade::api::rect hudRect = { 20, 20, 220, 35 };
+
+            reshade::api::command_list* cmdList = queue->get_immediate_command_list();
+            if (cmdList != nullptr) {
+                cmdList->clear_render_target_view(rtv, color, 1, &hudRect);
+            }
+        }
+    }
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (GTX 1650 HUD)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML Runtime with HUD Telemetry for Forza Horizon 2";
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (HUD Visual Feed)";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML Runtime with Screen Overlay Effect";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
