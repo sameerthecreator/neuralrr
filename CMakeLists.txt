@@ -9,7 +9,6 @@ add_definitions(-DUNICODE -D_UNICODE -DNOMINMAX -DWIN32_LEAN_AND_MEAN)
 include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/reshade/include
     ${CMAKE_CURRENT_SOURCE_DIR}/onnxruntime/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/directml/include
 )
 
 add_library(neural_shader SHARED main.cpp)
