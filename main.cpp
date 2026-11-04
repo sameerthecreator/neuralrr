@@ -35,6 +35,7 @@ typedef HRESULT (WINAPI* PFN_DMLCreateDevice)(
 struct NeuralContext {
     std::atomic<bool> is_ready{false};
     std::atomic<bool> is_loading{false};
+    std::atomic<bool> is_paused{false};
     std::atomic<bool> has_failed{false};
     std::atomic<uint64_t> total_frames{0};
     std::atomic<uint64_t> ai_frames{0};
@@ -155,13 +156,33 @@ static void AsyncInitDirectML() {
     g_ctx.is_ready = true;
 }
 
+static void on_init_swapchain(reshade::api::swapchain*) {
+    // Unpause when swapchain finishes recreating (e.g., transition from 2D intro into 3D world)
+    g_ctx.is_paused = false;
+    if (g_ctx.logFile.is_open()) {
+        g_ctx.logFile << "[NeuralShader] Swapchain reconstructed (entering new scene/depth buffer).\n";
+        g_ctx.logFile.flush();
+    }
+}
+
+static void on_destroy_swapchain(reshade::api::swapchain*) {
+    // Pause inference while Azimuth destroys old buffers to create the 3D depth target
+    g_ctx.is_paused = true;
+    while (g_isInferring.load()) {
+        std::this_thread::yield();
+    }
+    if (g_ctx.logFile.is_open()) {
+        g_ctx.logFile << "[NeuralShader] Swapchain destroying: paused inference safely.\n";
+        g_ctx.logFile.flush();
+    }
+}
+
 static void on_present(reshade::api::command_queue*, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
     uint64_t frame = ++g_ctx.total_frames;
 
     if (swapchain->get_device()->get_api() != reshade::api::device_api::d3d12) return;
-    if (g_ctx.has_failed) return;
+    if (g_ctx.has_failed || g_ctx.is_paused) return;
 
-    // Start background init only after passing the initial splash (100 frames)
     if (!g_ctx.is_ready && !g_ctx.is_loading && frame > 100) {
         g_ctx.is_loading = true;
         g_ctx.d3d12Device = reinterpret_cast<ID3D12Device*>(swapchain->get_device()->get_native());
@@ -169,13 +190,11 @@ static void on_present(reshade::api::command_queue*, reshade::api::swapchain* sw
         initThread.detach();
     }
 
-    // Only dispatch inference once well past the loading screen (frame > 250)
     if (g_ctx.is_ready && frame > 250 && (frame % 2 == 0)) {
         bool expected = false;
         if (g_isInferring.compare_exchange_strong(expected, true)) {
             OrtValue* outputTensor = nullptr;
 
-            // Correct ORT C API: output is allocated by ORT and returned into outputTensor
             OrtStatus* status = g_ctx.ort->Run(
                 g_ctx.session,
                 nullptr,
@@ -209,8 +228,8 @@ static void on_present(reshade::api::command_queue*, reshade::api::swapchain* sw
     }
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (GTX 1650 Dedicated Queue)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Dedicated Queue DirectML Addon for Forza Horizon 2";
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (GTX 1650 Stable)";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "Transition-safe DirectML Addon for Forza Horizon 2";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
@@ -230,11 +249,15 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
         }
 
         if (!reshade::register_addon(hinstDLL)) return FALSE;
+        reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
+        reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
         reshade::register_event<reshade::addon_event::present>(on_present);
         break;
     }
     case DLL_PROCESS_DETACH:
         reshade::unregister_event<reshade::addon_event::present>(on_present);
+        reshade::unregister_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
+        reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::unregister_addon(hinstDLL);
 
         if (g_ctx.is_ready) {
