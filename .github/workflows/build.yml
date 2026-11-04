@@ -22,9 +22,16 @@ jobs:
     - name: Download ONNX Runtime DirectML
       shell: pwsh
       run: |
-        Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.16.1/onnxruntime-win-x64-directml-1.16.1.zip" -OutFile "onnxruntime.zip"
-        Expand-Archive -Path "onnxruntime.zip" -DestinationPath "."
-        Rename-Item -Path "onnxruntime-win-x64-directml-1.16.1" -NewName "onnxruntime"
+        # Download the official Microsoft.ML.OnnxRuntime.DirectML NuGet package
+        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.16.3" -OutFile "onnxruntime.zip"
+        Expand-Archive -Path "onnxruntime.zip" -DestinationPath "nuget_extracted"
+        
+        # Organize into standard onnxruntime include and lib folders
+        New-Item -ItemType Directory -Force -Path "onnxruntime\include"
+        New-Item -ItemType Directory -Force -Path "onnxruntime\lib"
+        
+        Copy-Item -Path "nuget_extracted\build\native\include\*" -Destination "onnxruntime\include" -Recurse
+        Copy-Item -Path "nuget_extracted\runtimes\win-x64\native\*" -Destination "onnxruntime\lib" -Recurse
 
     - name: Set up MSVC environment
       uses: ilammy/msvc-dev-cmd@v1
@@ -45,6 +52,9 @@ jobs:
           /link /DELAYLOAD:onnxruntime.dll
 
         Copy-Item -Path "onnxruntime\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
+        if (Test-Path "onnxruntime\lib\DirectML.dll") {
+          Copy-Item -Path "onnxruntime\lib\DirectML.dll" -Destination ".\DirectML.dll"
+        }
 
     - name: Upload compiled addon artifacts
       uses: actions/upload-artifact@v4
@@ -53,3 +63,4 @@ jobs:
         path: |
           neural_shader.dll
           onnxruntime.dll
+          DirectML.dll
