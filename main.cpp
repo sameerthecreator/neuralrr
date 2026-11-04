@@ -50,13 +50,11 @@ static void on_init_effect_runtime(reshade::api::effect_runtime* runtime) {
         session_options.SetIntraOpNumThreads(4);
         session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
-        // Attach DirectML execution provider
         OrtSessionOptionsAppendExecutionProvider_DML(session_options, 0);
 
         std::wstring model_full_path = get_addon_directory() + L"neural_shader_gtx1650_sharp.onnx";
-        
         g_ort_session = new Ort::Session(*g_ort_env, model_full_path.c_str(), session_options);
-        
+
         if (!g_memory_info) {
             g_memory_info = new Ort::MemoryInfo(Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU));
         }
@@ -88,7 +86,6 @@ static void on_destroy_effect_runtime(reshade::api::effect_runtime* runtime) {
 }
 
 static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list, reshade::api::resource_view rtv, reshade::api::resource_view) {
-    // Null safety guard against 0x0 access violation
     if (!runtime || !cmd_list || rtv.handle == 0 || !g_ort_session || !g_memory_info) {
         return;
     }
@@ -96,9 +93,10 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, res
     if (GetAsyncKeyState(VK_F10) & 0x0001) {
         g_ai_enabled = !g_ai_enabled;
         MessageBeep(g_ai_enabled ? MB_OK : MB_ICONEXCLAMATION);
+        log_debug(std::string("F10 Pressed: AI is ") + (g_ai_enabled ? "ON" : "OFF"));
     }
     if (GetAsyncKeyState(VK_F11) & 0x0001) {
-        g_ai_multiplier = (std::min)(g_ai_multiplier + 0.5f, 5.0f);
+        g_ai_multiplier = (std::min)(g_ai_multiplier + 0.5f, 6.0f);
         MessageBeep(MB_OK);
     }
     if (GetAsyncKeyState(VK_F9) & 0x0001) {
@@ -118,10 +116,8 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, res
     int64_t width = color_desc.texture.width;
     int64_t height = color_desc.texture.height;
 
-    // Validate resource bounds
     if (width <= 0 || height <= 0 || width > 3840 || height > 2160) return;
 
-    // Allocate or reallocate staging buffers
     if (g_staging_color_read.handle == 0 || device->get_resource_desc(g_staging_color_read).texture.width != width) {
         if (g_staging_color_read.handle != 0) {
             device->destroy_resource(g_staging_color_read);
@@ -153,15 +149,12 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, res
     }
 
     int64_t input_channels = 7;
-    int64_t output_channels = 3;
     size_t plane_size = height * width;
 
     std::vector<float> input_tensor(plane_size * input_channels, 0.0f);
-    std::vector<float> output_tensor(plane_size * output_channels, 0.0f);
-
     uint8_t* color_data = static_cast<uint8_t*>(mapped_color.data);
 
-    // Unpack R10G10B10A2 format
+    // Unpack R10G10B10A2
     for (int y = 0; y < height; ++y) {
         uint32_t* row = reinterpret_cast<uint32_t*>(color_data + y * mapped_color.row_pitch);
         for (int x = 0; x < width; ++x) {
@@ -170,28 +163,40 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, res
             input_tensor[0 * plane_size + idx] = (p & 0x3FF) / 1023.0f;
             input_tensor[1 * plane_size + idx] = ((p >> 10) & 0x3FF) / 1023.0f;
             input_tensor[2 * plane_size + idx] = ((p >> 20) & 0x3FF) / 1023.0f;
-            input_tensor[3 * plane_size + idx] = 0.5f;
-            input_tensor[4 * plane_size + idx] = 0.5f;
-            input_tensor[5 * plane_size + idx] = 0.5f;
-            input_tensor[6 * plane_size + idx] = 1.0f;
+            input_tensor[3 * plane_size + idx] = 0.5f; // depth baseline
+            input_tensor[4 * plane_size + idx] = 0.5f; // normal x
+            input_tensor[5 * plane_size + idx] = 0.5f; // normal y
+            input_tensor[6 * plane_size + idx] = 1.0f; // normal z
         }
     }
     device->unmap_texture_region(g_staging_color_read, 0);
 
     std::vector<int64_t> input_dims = {1, input_channels, height, width};
-    std::vector<int64_t> output_dims = {1, output_channels, height, width};
+    Ort::Value input_tensor_val = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), input_tensor.data(), input_tensor.size(), input_dims.data(), input_dims.size());
 
+    const char* input_names[] = {"g_buffer"};
+    const char* output_names[] = {"rendered_frame"};
+
+    // Fetch the dynamically allocated output tensor from DirectML
+    std::vector<Ort::Value> output_tensors;
     try {
-        Ort::Value input_tensor_val = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), input_tensor.data(), input_tensor.size(), input_dims.data(), input_dims.size());
-        Ort::Value output_tensor_val = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), output_tensor.data(), output_tensor.size(), output_dims.data(), output_dims.size());
-
-        const char* input_names[] = {"g_buffer"};
-        const char* output_names[] = {"rendered_frame"};
-
-        g_ort_session->Run(Ort::RunOptions{nullptr}, input_names, &input_tensor_val, 1, output_names, &output_tensor_val, 1);
+        output_tensors = g_ort_session->Run(
+            Ort::RunOptions{nullptr}, 
+            input_names, &input_tensor_val, 1, 
+            output_names, 1
+        );
+    } catch (const std::exception& e) {
+        static int err_cnt = 0;
+        if (err_cnt++ < 3) log_debug(std::string("Run error: ") + e.what());
+        return;
     } catch (...) {
         return;
     }
+
+    if (output_tensors.empty()) return;
+
+    float* output_data = output_tensors[0].GetTensorMutableData<float>();
+    if (!output_data) return;
 
     reshade::api::subresource_data mapped_write;
     if (!device->map_texture_region(g_staging_color_write, 0, nullptr, reshade::api::map_access::write_only, &mapped_write)) return;
@@ -206,9 +211,9 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, res
             float g_orig = input_tensor[1 * plane_size + idx];
             float b_orig = input_tensor[2 * plane_size + idx];
 
-            float r_ai = std::clamp(output_tensor[0 * plane_size + idx], 0.0f, 1.0f);
-            float g_ai = std::clamp(output_tensor[1 * plane_size + idx], 0.0f, 1.0f);
-            float b_ai = std::clamp(output_tensor[2 * plane_size + idx], 0.0f, 1.0f);
+            float r_ai = std::clamp(output_data[0 * plane_size + idx], 0.0f, 1.0f);
+            float g_ai = std::clamp(output_data[1 * plane_size + idx], 0.0f, 1.0f);
+            float b_ai = std::clamp(output_data[2 * plane_size + idx], 0.0f, 1.0f);
 
             float r_final = std::clamp(r_orig + (r_ai - r_orig) * g_ai_multiplier, 0.0f, 1.0f);
             float g_final = std::clamp(g_orig + (g_ai - g_orig) * g_ai_multiplier, 0.0f, 1.0f);
@@ -226,7 +231,7 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, res
 }
 
 extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (HDR2SDR)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML 7-Channel HDR2SDR";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML Dynamic Output Hook";
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
