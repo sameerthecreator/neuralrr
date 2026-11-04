@@ -2,29 +2,21 @@
 #include <reshade.hpp>
 #include <onnxruntime_cxx_api.h>
 #include <dml_provider_factory.h>
-#include <d3d12.h>
 #include <Windows.h>
 #include <vector>
 #include <algorithm>
 #include <string>
-#include <fstream>
 
 static Ort::Env* g_ort_env = nullptr;
 static Ort::Session* g_ort_session = nullptr;
 static Ort::MemoryInfo* g_memory_info = nullptr;
 
-static reshade::api::resource g_gpu_input_tex = { 0 };
-static reshade::api::resource g_gpu_output_tex = { 0 };
-static reshade::api::resource g_staging_read = { 0 };
-static reshade::api::resource g_staging_write = { 0 };
+static reshade::api::resource g_staging_color_read = { 0 };
+static reshade::api::resource g_staging_color_write = { 0 };
 
 static bool g_ai_enabled = true;
 static float g_ai_multiplier = 3.0f;
 static HMODULE g_module_handle = nullptr;
-
-// Internal inference resolution (prevents GTX 1650 TDR timeout while executing full model)
-constexpr int INFER_WIDTH = 512;
-constexpr int INFER_HEIGHT = 512;
 
 static std::wstring get_addon_directory() {
     wchar_t path[MAX_PATH];
@@ -36,20 +28,22 @@ static std::wstring get_addon_directory() {
 
 static void on_init_swapchain(reshade::api::swapchain* swapchain, bool) {
     if (!swapchain || g_ort_session) return;
-
     try {
         if (!g_ort_env) {
-            g_ort_env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "HDR2SDR_DirectML");
+            g_ort_env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "HDR2SDR_NeuralShader");
         }
 
-        Ort::SessionOptions options;
-        options.SetIntraOpNumThreads(4);
-        options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
-        OrtSessionOptionsAppendExecutionProvider_DML(options, 0);
+        Ort::SessionOptions session_options;
+        session_options.SetIntraOpNumThreads(4);
+        session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+        OrtSessionOptionsAppendExecutionProvider_DML(session_options, 0);
 
-        std::wstring model_path = get_addon_directory() + L"neural_shader_gtx1650_sharp.onnx";
-        g_ort_session = new Ort::Session(*g_ort_env, model_path.c_str(), options);
-        g_memory_info = new Ort::MemoryInfo(Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU));
+        std::wstring model_full_path = get_addon_directory() + L"neural_shader_gtx1650_sharp.onnx";
+        g_ort_session = new Ort::Session(*g_ort_env, model_full_path.c_str(), session_options);
+
+        if (!g_memory_info) {
+            g_memory_info = new Ort::MemoryInfo(Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU));
+        }
     } catch (...) {}
 }
 
@@ -58,8 +52,14 @@ static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool) {
     reshade::api::device* device = swapchain->get_device();
     if (!device) return;
 
-    if (g_staging_read.handle != 0) { device->destroy_resource(g_staging_read); g_staging_read = { 0 }; }
-    if (g_staging_write.handle != 0) { device->destroy_resource(g_staging_write); g_staging_write = { 0 }; }
+    if (g_staging_color_read.handle != 0) {
+        device->destroy_resource(g_staging_color_read);
+        g_staging_color_read = { 0 };
+    }
+    if (g_staging_color_write.handle != 0) {
+        device->destroy_resource(g_staging_color_write);
+        g_staging_color_write = { 0 };
+    }
 }
 
 static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
@@ -68,6 +68,14 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     if (GetAsyncKeyState(VK_F10) & 0x0001) {
         g_ai_enabled = !g_ai_enabled;
         MessageBeep(g_ai_enabled ? MB_OK : MB_ICONEXCLAMATION);
+    }
+    if (GetAsyncKeyState(VK_F11) & 0x0001) {
+        g_ai_multiplier = (std::min)(g_ai_multiplier + 0.5f, 6.0f);
+        MessageBeep(MB_OK);
+    }
+    if (GetAsyncKeyState(VK_F9) & 0x0001) {
+        g_ai_multiplier = (std::max)(g_ai_multiplier - 0.5f, 0.1f);
+        MessageBeep(MB_OK);
     }
 
     if (!g_ai_enabled) return;
@@ -78,122 +86,167 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     }
 
     reshade::api::device* device = queue->get_device();
+    if (!device) return;
+
     reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
     if (backbuffer.handle == 0) return;
 
-    reshade::api::resource_desc bb_desc = device->get_resource_desc(backbuffer);
-    int64_t bb_w = bb_desc.texture.width;
-    int64_t bb_h = bb_desc.texture.height;
+    reshade::api::resource_desc color_desc = device->get_resource_desc(backbuffer);
+    int64_t width = color_desc.texture.width;
+    int64_t height = color_desc.texture.height;
+    reshade::api::format fmt = color_desc.texture.format;
 
-    // Allocate fixed-size staging buffers for the 512x512 neural pass
-    if (g_staging_read.handle == 0) {
-        reshade::api::resource_desc desc = {};
-        desc.type = reshade::api::resource_type::texture_2d;
-        desc.texture.width = INFER_WIDTH;
-        desc.texture.height = INFER_HEIGHT;
-        desc.texture.depth_or_layers = 1;
-        desc.texture.levels = 1;
-        desc.texture.format = reshade::api::format::r8g8b8a8_unorm;
-        desc.heap = reshade::api::memory_heap::gpu_to_cpu;
-        desc.usage = reshade::api::resource_usage::copy_dest;
-        device->create_resource(desc, nullptr, reshade::api::resource_usage::copy_dest, &g_staging_read);
+    if (width <= 0 || height <= 0 || width > 3840 || height > 2160) return;
 
-        desc.heap = reshade::api::memory_heap::cpu_to_gpu;
-        desc.usage = reshade::api::resource_usage::copy_source;
-        device->create_resource(desc, nullptr, reshade::api::resource_usage::copy_source, &g_staging_write);
+    bool is_10bit = (fmt == reshade::api::format::r10g10b10a2_unorm || fmt == reshade::api::format::b10g10r10a2_unorm);
+    bool is_bgra = (fmt == reshade::api::format::b8g8r8a8_unorm || fmt == reshade::api::format::b8g8r8a8_unorm_srgb || fmt == reshade::api::format::b10g10r10a2_unorm);
+
+    // Staging resources: match resolution and format exactly to the backbuffer
+    if (g_staging_color_read.handle == 0 || device->get_resource_desc(g_staging_color_read).texture.width != width) {
+        if (g_staging_color_read.handle != 0) {
+            device->destroy_resource(g_staging_color_read);
+            device->destroy_resource(g_staging_color_write);
+            g_staging_color_read = { 0 };
+            g_staging_color_write = { 0 };
+        }
+        reshade::api::resource_desc stage_desc = color_desc;
+        stage_desc.heap = reshade::api::memory_heap::gpu_to_cpu;
+        stage_desc.usage = reshade::api::resource_usage::copy_dest;
+        device->create_resource(stage_desc, nullptr, reshade::api::resource_usage::copy_dest, &g_staging_color_read);
+
+        stage_desc.heap = reshade::api::memory_heap::cpu_to_gpu;
+        stage_desc.usage = reshade::api::resource_usage::copy_source;
+        device->create_resource(stage_desc, nullptr, reshade::api::resource_usage::copy_source, &g_staging_color_write);
     }
+
+    if (g_staging_color_read.handle == 0 || g_staging_color_write.handle == 0) return;
 
     reshade::api::command_list* cmd_list = queue->get_immediate_command_list();
     if (!cmd_list) return;
 
-    // Step 1: Copy from full backbuffer to staging texture (handles downscale resolve)
-    cmd_list->barrier(backbuffer, reshade::api::resource_usage::present, reshade::api::resource_usage::copy_source);
-    
-    reshade::api::subresource_box src_box = { 0, 0, 0, static_cast<uint32_t>(bb_w), static_cast<uint32_t>(bb_h), 1 };
-    reshade::api::subresource_box dst_box = { 0, 0, 0, INFER_WIDTH, INFER_HEIGHT, 1 };
-    cmd_list->copy_texture_region(backbuffer, 0, &src_box, g_staging_read, 0, &dst_box);
-
+    // 1:1 hardware copy to staging
+    cmd_list->copy_resource(backbuffer, g_staging_color_read);
     queue->wait_idle();
 
-    // Step 2: Map and pack the 7-channel planar tensor for the complete ONNX model
-    reshade::api::subresource_data mapped_read;
-    if (!device->map_texture_region(g_staging_read, 0, nullptr, reshade::api::map_access::read_only, &mapped_read)) {
-        cmd_list->barrier(backbuffer, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::present);
+    reshade::api::subresource_data mapped_color;
+    if (!device->map_texture_region(g_staging_color_read, 0, nullptr, reshade::api::map_access::read_only, &mapped_color)) {
         return;
     }
 
-    size_t plane_size = INFER_WIDTH * INFER_HEIGHT;
-    std::vector<float> input_tensor(plane_size * 7, 0.0f);
-    uint8_t* raw_src = static_cast<uint8_t*>(mapped_read.data);
+    int64_t input_channels = 7;
+    size_t plane_size = height * width;
+    std::vector<float> input_tensor(plane_size * input_channels, 0.0f);
+    uint8_t* color_data = static_cast<uint8_t*>(mapped_color.data);
 
-    for (int y = 0; y < INFER_HEIGHT; ++y) {
-        uint8_t* row = raw_src + (y * mapped_read.row_pitch);
-        for (int x = 0; x < INFER_WIDTH; ++x) {
-            int idx = y * INFER_WIDTH + x;
-            input_tensor[0 * plane_size + idx] = row[x * 4 + 0] / 255.0f; // R
-            input_tensor[1 * plane_size + idx] = row[x * 4 + 1] / 255.0f; // G
-            input_tensor[2 * plane_size + idx] = row[x * 4 + 2] / 255.0f; // B
-            input_tensor[3 * plane_size + idx] = 0.5f;                    // Depth
-            input_tensor[4 * plane_size + idx] = 0.5f;                    // Normal X
-            input_tensor[5 * plane_size + idx] = 0.5f;                    // Normal Y
-            input_tensor[6 * plane_size + idx] = 1.0f;                    // Normal Z
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = color_data + y * mapped_color.row_pitch;
+        for (int x = 0; x < width; ++x) {
+            int idx = y * width + x;
+            float r = 0.0f, g = 0.0f, b = 0.0f;
+
+            if (is_10bit) {
+                uint32_t p = reinterpret_cast<uint32_t*>(row)[x];
+                r = (p & 0x3FF) / 1023.0f;
+                g = ((p >> 10) & 0x3FF) / 1023.0f;
+                b = ((p >> 20) & 0x3FF) / 1023.0f;
+                if (is_bgra) std::swap(r, b);
+            } else {
+                uint8_t b_raw = row[x * 4 + 0];
+                uint8_t g_raw = row[x * 4 + 1];
+                uint8_t r_raw = row[x * 4 + 2];
+                if (!is_bgra) std::swap(b_raw, r_raw);
+                r = r_raw / 255.0f;
+                g = g_raw / 255.0f;
+                b = b_raw / 255.0f;
+            }
+
+            input_tensor[0 * plane_size + idx] = r;
+            input_tensor[1 * plane_size + idx] = g;
+            input_tensor[2 * plane_size + idx] = b;
+            input_tensor[3 * plane_size + idx] = 0.5f;
+            input_tensor[4 * plane_size + idx] = 0.5f;
+            input_tensor[5 * plane_size + idx] = 0.5f;
+            input_tensor[6 * plane_size + idx] = 1.0f;
         }
     }
-    device->unmap_texture_region(g_staging_read, 0);
+    device->unmap_texture_region(g_staging_color_read, 0);
 
-    // Step 3: Run the COMPLETE trained ONNX model
-    std::vector<int64_t> input_dims = { 1, 7, INFER_HEIGHT, INFER_WIDTH };
-    Ort::Value in_val = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), input_tensor.data(), input_tensor.size(), input_dims.data(), input_dims.size());
+    // Run the complete ONNX model
+    std::vector<int64_t> input_dims = { 1, input_channels, height, width };
+    Ort::Value input_tensor_val = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), input_tensor.data(), input_tensor.size(), input_dims.data(), input_dims.size());
 
-    const char* in_names[] = { "g_buffer" };
-    const char* out_names[] = { "rendered_frame" };
+    const char* input_names[] = { "g_buffer" };
+    const char* output_names[] = { "rendered_frame" };
 
-    std::vector<Ort::Value> outputs;
+    std::vector<Ort::Value> output_tensors;
     try {
-        outputs = g_ort_session->Run(Ort::RunOptions{ nullptr }, in_names, &in_val, 1, out_names, 1);
+        output_tensors = g_ort_session->Run(
+            Ort::RunOptions{ nullptr },
+            input_names, &input_tensor_val, 1,
+            output_names, 1
+        );
     } catch (...) {
-        cmd_list->barrier(backbuffer, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::present);
         return;
     }
 
-    if (outputs.empty()) {
-        cmd_list->barrier(backbuffer, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::present);
-        return;
-    }
+    if (output_tensors.empty()) return;
+    float* output_data = output_tensors[0].GetTensorMutableData<float>();
+    if (!output_data) return;
 
-    float* out_data = outputs[0].GetTensorMutableData<float>();
-
-    // Step 4: Write output tensor back to the staging write texture
     reshade::api::subresource_data mapped_write;
-    if (device->map_texture_region(g_staging_write, 0, nullptr, reshade::api::map_access::write_only, &mapped_write)) {
-        uint8_t* raw_dst = static_cast<uint8_t*>(mapped_write.data);
-        for (int y = 0; y < INFER_HEIGHT; ++y) {
-            uint8_t* row = raw_dst + (y * mapped_write.row_pitch);
-            for (int x = 0; x < INFER_WIDTH; ++x) {
-                int idx = y * INFER_WIDTH + x;
-                float r = std::clamp(out_data[0 * plane_size + idx] * g_ai_multiplier, 0.0f, 1.0f);
-                float g = std::clamp(out_data[1 * plane_size + idx] * g_ai_multiplier, 0.0f, 1.0f);
-                float b = std::clamp(out_data[2 * plane_size + idx] * g_ai_multiplier, 0.0f, 1.0f);
+    if (!device->map_texture_region(g_staging_color_write, 0, nullptr, reshade::api::map_access::write_only, &mapped_write)) return;
 
-                row[x * 4 + 0] = static_cast<uint8_t>(r * 255.0f);
-                row[x * 4 + 1] = static_cast<uint8_t>(g * 255.0f);
-                row[x * 4 + 2] = static_cast<uint8_t>(b * 255.0f);
-                row[x * 4 + 3] = 255;
+    uint8_t* write_data = static_cast<uint8_t*>(mapped_write.data);
+
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = write_data + y * mapped_write.row_pitch;
+        for (int x = 0; x < width; ++x) {
+            int idx = y * width + x;
+
+            float r_orig = input_tensor[0 * plane_size + idx];
+            float g_orig = input_tensor[1 * plane_size + idx];
+            float b_orig = input_tensor[2 * plane_size + idx];
+
+            float r_ai = std::clamp(output_data[0 * plane_size + idx], 0.0f, 1.0f);
+            float g_ai = std::clamp(output_data[1 * plane_size + idx], 0.0f, 1.0f);
+            float b_ai = std::clamp(output_data[2 * plane_size + idx], 0.0f, 1.0f);
+
+            float r_final = std::clamp(r_orig + (r_ai - r_orig) * g_ai_multiplier, 0.0f, 1.0f);
+            float g_final = std::clamp(g_orig + (g_ai - g_orig) * g_ai_multiplier, 0.0f, 1.0f);
+            float b_final = std::clamp(b_orig + (b_ai - b_orig) * g_ai_multiplier, 0.0f, 1.0f);
+
+            if (is_10bit) {
+                if (is_bgra) std::swap(r_final, b_final);
+                uint32_t r_int = static_cast<uint32_t>(r_final * 1023.0f);
+                uint32_t g_int = static_cast<uint32_t>(g_final * 1023.0f);
+                uint32_t b_int = static_cast<uint32_t>(b_final * 1023.0f);
+                reinterpret_cast<uint32_t*>(row)[x] = r_int | (g_int << 10) | (b_int << 20) | (3u << 30);
+            } else {
+                uint8_t r_byte = static_cast<uint8_t>(r_final * 255.0f);
+                uint8_t g_byte = static_cast<uint8_t>(g_final * 255.0f);
+                uint8_t b_byte = static_cast<uint8_t>(b_final * 255.0f);
+                if (is_bgra) {
+                    row[x * 4 + 0] = b_byte;
+                    row[x * 4 + 1] = g_byte;
+                    row[x * 4 + 2] = r_byte;
+                    row[x * 4 + 3] = 255;
+                } else {
+                    row[x * 4 + 0] = r_byte;
+                    row[x * 4 + 1] = g_byte;
+                    row[x * 4 + 2] = b_byte;
+                    row[x * 4 + 3] = 255;
+                }
             }
         }
-        device->unmap_texture_region(g_staging_write, 0);
-
-        // Step 5: Upscale/Blit neural output directly over the active backbuffer
-        cmd_list->barrier(backbuffer, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::copy_dest);
-        cmd_list->copy_texture_region(g_staging_write, 0, &dst_box, backbuffer, 0, &src_box);
-        cmd_list->barrier(backbuffer, reshade::api::resource_usage::copy_dest, reshade::api::resource_usage::present);
-    } else {
-        cmd_list->barrier(backbuffer, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::present);
     }
+    device->unmap_texture_region(g_staging_color_write, 0);
+
+    // Blit processed tensor output directly to the active presentation backbuffer
+    cmd_list->copy_resource(g_staging_color_write, backbuffer);
 }
 
 extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (HDR2SDR)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Full Model DirectML Blit Hook";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML Full Model Native Present Hook";
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
