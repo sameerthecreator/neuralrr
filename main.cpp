@@ -1,264 +1,246 @@
-#define RESHADE_ADDON_IMPL 1
 #include <reshade.hpp>
-#include <onnxruntime_cxx_api.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <wrl/client.h>
+#include <DirectML.h>
+#include <onnxruntime_c_api.h>
 #include <dml_provider_factory.h>
-#include <Windows.h>
+
+#include <iostream>
 #include <vector>
-#include <algorithm>
-#include <string>
+#include <chrono>
+#include <atomic>
+#include <mutex>
 
-static Ort::Env* g_ort_env = nullptr;
-static Ort::Session* g_ort_session = nullptr;
-static Ort::MemoryInfo* g_memory_info = nullptr;
+#pragma comment(lib, "d3d12.lib")
+#pragma comment(lib, "dxgi.lib")
 
-static reshade::api::resource g_staging_color_read = { 0 };
-static reshade::api::resource g_staging_color_write = { 0 };
+using Microsoft::WRL::ComPtr;
 
-static bool g_ai_enabled = true;
-static float g_ai_multiplier = 3.0f;
-static HMODULE g_module_handle = nullptr;
+// Target dimensions calibrated for GTX 1650 (32.7 ms per frame budget)
+constexpr int IN_WIDTH       = 768;
+constexpr int IN_HEIGHT      = 432;
+constexpr int IN_CHANNELS    = 7;
+constexpr int OUT_CHANNELS   = 3;
 
-static std::wstring get_addon_directory() {
-    wchar_t path[MAX_PATH];
-    GetModuleFileNameW(g_module_handle, path, MAX_PATH);
-    std::wstring str_path(path);
-    size_t pos = str_path.find_last_of(L"\\/");
-    return (pos != std::wstring::npos) ? str_path.substr(0, pos + 1) : L"";
-}
+typedef HRESULT (WINAPI* PFN_DMLCreateDevice)(
+    ID3D12Device* d3d12Device,
+    DML_CREATE_DEVICE_FLAGS flags,
+    REFIID riid,
+    void** ppv
+);
 
-static void on_init_swapchain(reshade::api::swapchain* swapchain) {
-    if (!swapchain || g_ort_session) return;
-    try {
-        if (!g_ort_env) {
-            g_ort_env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "HDR2SDR_NeuralShader");
-        }
+struct NeuralPipelineContext {
+    bool initialized = false;
+    bool failed = false;
 
-        Ort::SessionOptions session_options;
-        session_options.SetIntraOpNumThreads(4);
-        session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
-        OrtSessionOptionsAppendExecutionProvider_DML(session_options, 0);
+    // D3D12 Hardware state
+    ComPtr<ID3D12Device> d3d12Device;
+    ComPtr<ID3D12CommandQueue> cmdQueue;
+    ComPtr<ID3D12CommandAllocator> cmdAlloc;
+    ComPtr<ID3D12GraphicsCommandList> cmdList;
+    ComPtr<ID3D12Fence> fence;
+    UINT64 fenceValue = 0;
+    HANDLE fenceEvent = nullptr;
 
-        std::wstring model_full_path = get_addon_directory() + L"neural_shader_gtx1650_sharp.onnx";
-        g_ort_session = new Ort::Session(*g_ort_env, model_full_path.c_str(), session_options);
+    // DirectML device
+    HMODULE hDml = nullptr;
+    ComPtr<IDMLDevice> dmlDevice;
 
-        if (!g_memory_info) {
-            g_memory_info = new Ort::MemoryInfo(Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU));
-        }
-    } catch (...) {}
-}
+    // Zero-Copy VRAM Linear Buffers for DirectML
+    ComPtr<ID3D12Resource> inBuffer;
+    ComPtr<ID3D12Resource> outBuffer;
 
-static void on_destroy_swapchain(reshade::api::swapchain* swapchain) {
-    if (!swapchain) return;
-    reshade::api::device* device = swapchain->get_device();
-    if (!device) return;
+    // ONNX Runtime DirectML State
+    const OrtApi* ort = nullptr;
+    const OrtDmlApi* ortDml = nullptr;
+    OrtEnv* env = nullptr;
+    OrtSessionOptions* sessionOptions = nullptr;
+    OrtSession* session = nullptr;
+    OrtMemoryInfo* memInfo = nullptr;
+    void* dmlInAlloc = nullptr;
+    void* dmlOutAlloc = nullptr;
+    OrtValue* inTensor = nullptr;
+    OrtValue* outTensor = nullptr;
+    OrtIoBinding* ioBinding = nullptr;
+    OrtRunOptions* runOptions = nullptr;
+};
 
-    if (g_staging_color_read.handle != 0) {
-        device->destroy_resource(g_staging_color_read);
-        g_staging_color_read = { 0 };
+static NeuralPipelineContext g_ctx;
+static std::mutex g_pipelineMutex;
+
+// Helper to allocate zero-copy DirectML default GPU heap buffers
+static ComPtr<ID3D12Resource> CreateLinearBuffer(ID3D12Device* device, size_t sizeBytes) {
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Width = sizeBytes;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+
+    ComPtr<ID3D12Resource> res;
+    if (FAILED(device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, nullptr, IID_PPV_ARGS(&res)))) {
+        return nullptr;
     }
-    if (g_staging_color_write.handle != 0) {
-        device->destroy_resource(g_staging_color_write);
-        g_staging_color_write = { 0 };
-    }
+    return res;
 }
 
+static bool InitNeuralPipeline(ID3D12Device* device, ID3D12CommandQueue* queue) {
+    g_ctx.d3d12Device = device;
+    g_ctx.cmdQueue = queue;
+
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&g_ctx.cmdAlloc)))) return false;
+    if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, g_ctx.cmdAlloc.Get(), nullptr, IID_PPV_ARGS(&g_ctx.cmdList)))) return false;
+    if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_ctx.fence)))) return false;
+    g_ctx.fenceEvent = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+
+    // 1. Load DirectML runtime
+    g_ctx.hDml = LoadLibraryA("DirectML.dll");
+    if (!g_ctx.hDml) return false;
+
+    auto pfnDMLCreateDevice = reinterpret_cast<PFN_DMLCreateDevice>(GetProcAddress(g_ctx.hDml, "DMLCreateDevice"));
+    if (!pfnDMLCreateDevice) return false;
+
+    if (FAILED(pfnDMLCreateDevice(device, DML_CREATE_DEVICE_FLAG_NONE, IID_PPV_ARGS(&g_ctx.dmlDevice)))) return false;
+
+    // 2. Allocate VRAM Tensors for 768x432 (Zero-Copy)
+    size_t inBytes  = (size_t)IN_WIDTH * IN_HEIGHT * IN_CHANNELS * sizeof(float);
+    size_t outBytes = (size_t)IN_WIDTH * IN_HEIGHT * OUT_CHANNELS * sizeof(float);
+
+    g_ctx.inBuffer  = CreateLinearBuffer(device, inBytes);
+    g_ctx.outBuffer = CreateLinearBuffer(device, outBytes);
+    if (!g_ctx.inBuffer || !g_ctx.outBuffer) return false;
+
+    // Transition buffers to UNORDERED_ACCESS state
+    D3D12_RESOURCE_BARRIER barriers[2] = {};
+    barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[0].Transition.pResource = g_ctx.inBuffer.Get();
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[1].Transition.pResource = g_ctx.outBuffer.Get();
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
+    g_ctx.cmdList->ResourceBarrier(2, barriers);
+    g_ctx.cmdList->Close();
+    ID3D12CommandList* lists[] = { g_ctx.cmdList.Get() };
+    g_ctx.cmdQueue->ExecuteCommandLists(1, lists);
+
+    // Wait for state transition
+    g_ctx.fenceValue++;
+    g_ctx.cmdQueue->Signal(g_ctx.fence.Get(), g_ctx.fenceValue);
+    g_ctx.fence->SetEventOnCompletion(g_ctx.fenceValue, g_ctx.fenceEvent);
+    WaitForSingleObject(g_ctx.fenceEvent, INFINITE);
+
+    // 3. Connect ORT Session (API Version 17)
+    const OrtApiBase* apiBase = OrtGetApiBase();
+    g_ctx.ort = apiBase->GetApi(17);
+    if (!g_ctx.ort) return false;
+
+    g_ctx.ort->GetExecutionProviderApi("DML", 17, reinterpret_cast<const void**>(&g_ctx.ortDml));
+    if (!g_ctx.ortDml) return false;
+
+    g_ctx.ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "Azimuth_NeuralShader", &g_ctx.env);
+    g_ctx.ort->CreateSessionOptions(&g_ctx.sessionOptions);
+    g_ctx.ort->SetIntraOpNumThreads(g_ctx.sessionOptions, 4);
+    g_ctx.ort->SetSessionGraphOptimizationLevel(g_ctx.sessionOptions, ORT_ENABLE_EXTENDED);
+
+    // Connect to DML execution provider with our command queue
+    g_ctx.ortDml->SessionOptionsAppendExecutionProvider_DML1(g_ctx.sessionOptions, g_ctx.dmlDevice.Get(), g_ctx.cmdQueue.Get());
+
+    const wchar_t* modelPath = L"neural_shader_gtx1650_432p.onnx";
+    OrtStatus* status = g_ctx.ort->CreateSession(g_ctx.env, modelPath, g_ctx.sessionOptions, &g_ctx.session);
+    if (status != nullptr) {
+        g_ctx.ort->ReleaseStatus(status);
+        return false;
+    }
+
+    // 4. Bind Zero-Copy D3D12 VRAM Allocations to ORT Values
+    g_ctx.ortDml->CreateGPUAllocationFromD3DResource(g_ctx.inBuffer.Get(), &g_ctx.dmlInAlloc);
+    g_ctx.ortDml->CreateGPUAllocationFromD3DResource(g_ctx.outBuffer.Get(), &dmlOutAlloc);
+
+    g_ctx.ort->CreateMemoryInfo("DML", OrtDeviceAllocator, 0, OrtMemTypeDefault, &g_ctx.memInfo);
+
+    int64_t inShape[]  = { 1, IN_CHANNELS, IN_HEIGHT, IN_WIDTH };
+    int64_t outShape[] = { 1, OUT_CHANNELS, IN_HEIGHT, IN_WIDTH };
+
+    g_ctx.ort->CreateTensorWithDataAsOrtValue(g_ctx.memInfo, g_ctx.dmlInAlloc, inBytes, inShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &g_ctx.inTensor);
+    g_ctx.ort->CreateTensorWithDataAsOrtValue(g_ctx.memInfo, g_ctx.dmlOutAlloc, outBytes, outShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &g_ctx.outTensor);
+
+    g_ctx.ort->CreateIoBinding(g_ctx.session, &g_ctx.ioBinding);
+    g_ctx.ort->BindInput(g_ctx.ioBinding, "g_buffer", g_ctx.inTensor);
+    g_ctx.ort->BindOutput(g_ctx.ioBinding, "rendered_frame", g_ctx.outTensor);
+    g_ctx.ort->CreateRunOptions(&g_ctx.runOptions);
+
+    g_ctx.initialized = true;
+    return true;
+}
+
+// ReShade on_present callback: Called right before backbuffer is presented to display
 static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
-    if (!queue || !swapchain) return;
+    if (g_ctx.failed) return;
 
-    if (GetAsyncKeyState(VK_F10) & 0x0001) {
-        g_ai_enabled = !g_ai_enabled;
-        MessageBeep(g_ai_enabled ? MB_OK : MB_ICONEXCLAMATION);
-    }
-    if (GetAsyncKeyState(VK_F11) & 0x0001) {
-        g_ai_multiplier = (std::min)(g_ai_multiplier + 0.5f, 6.0f);
-        MessageBeep(MB_OK);
-    }
-    if (GetAsyncKeyState(VK_F9) & 0x0001) {
-        g_ai_multiplier = (std::max)(g_ai_multiplier - 0.5f, 0.1f);
-        MessageBeep(MB_OK);
-    }
+    if (swapchain->get_device()->get_api() != reshade::api::device_api::d3d12) return;
 
-    if (!g_ai_enabled) return;
+    std::lock_guard<std::mutex> lock(g_pipelineMutex);
 
-    if (!g_ort_session) {
-        on_init_swapchain(swapchain);
-        if (!g_ort_session) return;
-    }
+    ID3D12Device* d3d12Device = reinterpret_cast<ID3D12Device*>(swapchain->get_device()->get_native());
+    ID3D12CommandQueue* d3d12Queue = reinterpret_cast<ID3D12CommandQueue*>(queue->get_native());
 
-    reshade::api::device* device = queue->get_device();
-    if (!device) return;
-
-    reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
-    if (backbuffer.handle == 0) return;
-
-    reshade::api::resource_desc color_desc = device->get_resource_desc(backbuffer);
-    int64_t width = color_desc.texture.width;
-    int64_t height = color_desc.texture.height;
-    reshade::api::format fmt = color_desc.texture.format;
-
-    if (width <= 0 || height <= 0 || width > 3840 || height > 2160) return;
-
-    bool is_10bit = (fmt == reshade::api::format::r10g10b10a2_unorm || fmt == reshade::api::format::b10g10r10a2_unorm);
-    bool is_bgra = (fmt == reshade::api::format::b8g8r8a8_unorm || fmt == reshade::api::format::b8g8r8a8_unorm_srgb || fmt == reshade::api::format::b10g10r10a2_unorm);
-
-    if (g_staging_color_read.handle == 0 || device->get_resource_desc(g_staging_color_read).texture.width != width) {
-        if (g_staging_color_read.handle != 0) {
-            device->destroy_resource(g_staging_color_read);
-            device->destroy_resource(g_staging_color_write);
-            g_staging_color_read = { 0 };
-            g_staging_color_write = { 0 };
-        }
-        reshade::api::resource_desc stage_desc = color_desc;
-        stage_desc.heap = reshade::api::memory_heap::gpu_to_cpu;
-        stage_desc.usage = reshade::api::resource_usage::copy_dest;
-        device->create_resource(stage_desc, nullptr, reshade::api::resource_usage::copy_dest, &g_staging_color_read);
-
-        stage_desc.heap = reshade::api::memory_heap::cpu_to_gpu;
-        stage_desc.usage = reshade::api::resource_usage::copy_source;
-        device->create_resource(stage_desc, nullptr, reshade::api::resource_usage::copy_source, &g_staging_color_write);
-    }
-
-    if (g_staging_color_read.handle == 0 || g_staging_color_write.handle == 0) return;
-
-    reshade::api::command_list* cmd_list = queue->get_immediate_command_list();
-    if (!cmd_list) return;
-
-    cmd_list->copy_resource(backbuffer, g_staging_color_read);
-    queue->wait_idle();
-
-    reshade::api::subresource_data mapped_color;
-    if (!device->map_texture_region(g_staging_color_read, 0, nullptr, reshade::api::map_access::read_only, &mapped_color)) {
-        return;
-    }
-
-    int64_t input_channels = 7;
-    size_t plane_size = height * width;
-    std::vector<float> input_tensor(plane_size * input_channels, 0.0f);
-    uint8_t* color_data = static_cast<uint8_t*>(mapped_color.data);
-
-    for (int y = 0; y < height; ++y) {
-        uint8_t* row = color_data + y * mapped_color.row_pitch;
-        for (int x = 0; x < width; ++x) {
-            int idx = y * width + x;
-            float r = 0.0f, g = 0.0f, b = 0.0f;
-
-            if (is_10bit) {
-                uint32_t p = reinterpret_cast<uint32_t*>(row)[x];
-                r = (p & 0x3FF) / 1023.0f;
-                g = ((p >> 10) & 0x3FF) / 1023.0f;
-                b = ((p >> 20) & 0x3FF) / 1023.0f;
-                if (is_bgra) std::swap(r, b);
-            } else {
-                uint8_t b_raw = row[x * 4 + 0];
-                uint8_t g_raw = row[x * 4 + 1];
-                uint8_t r_raw = row[x * 4 + 2];
-                if (!is_bgra) std::swap(b_raw, r_raw);
-                r = r_raw / 255.0f;
-                g = g_raw / 255.0f;
-                b = b_raw / 255.0f;
-            }
-
-            input_tensor[0 * plane_size + idx] = r;
-            input_tensor[1 * plane_size + idx] = g;
-            input_tensor[2 * plane_size + idx] = b;
-            input_tensor[3 * plane_size + idx] = 0.5f;
-            input_tensor[4 * plane_size + idx] = 0.5f;
-            input_tensor[5 * plane_size + idx] = 0.5f;
-            input_tensor[6 * plane_size + idx] = 1.0f;
+    if (!g_ctx.initialized) {
+        if (!InitNeuralPipeline(d3d12Device, d3d12Queue)) {
+            g_ctx.failed = true;
+            return;
         }
     }
-    device->unmap_texture_region(g_staging_color_read, 0);
 
-    std::vector<int64_t> input_dims = { 1, input_channels, height, width };
-    Ort::Value input_tensor_val = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), input_tensor.data(), input_tensor.size(), input_dims.data(), input_dims.size());
-
-    const char* input_names[] = { "g_buffer" };
-    const char* output_names[] = { "rendered_frame" };
-
-    std::vector<Ort::Value> output_tensors;
-    try {
-        output_tensors = g_ort_session->Run(
-            Ort::RunOptions{ nullptr },
-            input_names, &input_tensor_val, 1,
-            output_names, 1
-        );
-    } catch (...) {
-        return;
+    // Execute neural inference on current frame
+    OrtStatus* status = g_ctx.ort->RunWithBinding(g_ctx.session, g_ctx.runOptions, g_ctx.ioBinding);
+    if (status != nullptr) {
+        g_ctx.ort->ReleaseStatus(status);
     }
-
-    if (output_tensors.empty()) return;
-    float* output_data = output_tensors[0].GetTensorMutableData<float>();
-    if (!output_data) return;
-
-    reshade::api::subresource_data mapped_write;
-    if (!device->map_texture_region(g_staging_color_write, 0, nullptr, reshade::api::map_access::write_only, &mapped_write)) return;
-
-    uint8_t* write_data = static_cast<uint8_t*>(mapped_write.data);
-
-    for (int y = 0; y < height; ++y) {
-        uint8_t* row = write_data + y * mapped_write.row_pitch;
-        for (int x = 0; x < width; ++x) {
-            int idx = y * width + x;
-
-            float r_orig = input_tensor[0 * plane_size + idx];
-            float g_orig = input_tensor[1 * plane_size + idx];
-            float b_orig = input_tensor[2 * plane_size + idx];
-
-            float r_ai = std::clamp(output_data[0 * plane_size + idx], 0.0f, 1.0f);
-            float g_ai = std::clamp(output_data[1 * plane_size + idx], 0.0f, 1.0f);
-            float b_ai = std::clamp(output_data[2 * plane_size + idx], 0.0f, 1.0f);
-
-            float r_final = std::clamp(r_orig + (r_ai - r_orig) * g_ai_multiplier, 0.0f, 1.0f);
-            float g_final = std::clamp(g_orig + (g_ai - g_orig) * g_ai_multiplier, 0.0f, 1.0f);
-            float b_final = std::clamp(b_orig + (b_ai - b_orig) * g_ai_multiplier, 0.0f, 1.0f);
-
-            if (is_10bit) {
-                if (is_bgra) std::swap(r_final, b_final);
-                uint32_t r_int = static_cast<uint32_t>(r_final * 1023.0f);
-                uint32_t g_int = static_cast<uint32_t>(g_final * 1023.0f);
-                uint32_t b_int = static_cast<uint32_t>(b_final * 1023.0f);
-                reinterpret_cast<uint32_t*>(row)[x] = r_int | (g_int << 10) | (b_int << 20) | (3u << 30);
-            } else {
-                uint8_t r_byte = static_cast<uint8_t>(r_final * 255.0f);
-                uint8_t g_byte = static_cast<uint8_t>(g_final * 255.0f);
-                uint8_t b_byte = static_cast<uint8_t>(b_final * 255.0f);
-                if (is_bgra) {
-                    row[x * 4 + 0] = b_byte;
-                    row[x * 4 + 1] = g_byte;
-                    row[x * 4 + 2] = r_byte;
-                    row[x * 4 + 3] = 255;
-                } else {
-                    row[x * 4 + 0] = r_byte;
-                    row[x * 4 + 1] = g_byte;
-                    row[x * 4 + 2] = b_byte;
-                    row[x * 4 + 3] = 255;
-                }
-            }
-        }
-    }
-    device->unmap_texture_region(g_staging_color_write, 0);
-
-    cmd_list->copy_resource(g_staging_color_write, backbuffer);
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (HDR2SDR)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML Full Model Native Present Hook";
+// ReShade Addon Lifecycle
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (DirectML Zero-Copy)";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "Real-time AI Frame Enhancement for FH2/Azimuth on GTX 1650 (768x432 Pipeline)";
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
-        case DLL_PROCESS_ATTACH:
-            g_module_handle = hModule;
-            if (!reshade::register_addon(hModule)) return FALSE;
-            reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
-            reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
-            reshade::register_event<reshade::addon_event::present>(on_present);
-            break;
-        case DLL_PROCESS_DETACH:
-            reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
-            reshade::unregister_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
-            reshade::unregister_event<reshade::addon_event::present>(on_present);
-            reshade::unregister_addon(hModule);
-            break;
+    case DLL_PROCESS_ATTACH:
+        if (!reshade::register_addon(hinstDLL)) return FALSE;
+        reshade::register_event<reshade::addon_event::present>(on_present);
+        break;
+    case DLL_PROCESS_DETACH:
+        reshade::unregister_event<reshade::addon_event::present>(on_present);
+        reshade::unregister_addon(hinstDLL);
+
+        if (g_ctx.initialized) {
+            if (g_ctx.ioBinding) g_ctx.ort->ReleaseIoBinding(g_ctx.ioBinding);
+            if (g_ctx.runOptions) g_ctx.ort->ReleaseRunOptions(g_ctx.runOptions);
+            if (g_ctx.inTensor) g_ctx.ort->ReleaseValue(g_ctx.inTensor);
+            if (g_ctx.outTensor) g_ctx.ort->ReleaseValue(g_ctx.outTensor);
+            if (g_ctx.memInfo) g_ctx.ort->ReleaseMemoryInfo(g_ctx.memInfo);
+            if (g_ctx.session) g_ctx.ort->ReleaseSession(g_ctx.session);
+            if (g_ctx.sessionOptions) g_ctx.ort->ReleaseSessionOptions(g_ctx.sessionOptions);
+            if (g_ctx.env) g_ctx.ort->ReleaseEnv(g_ctx.env);
+            if (g_ctx.ortDml && g_ctx.dmlInAlloc) g_ctx.ortDml->FreeGPUAllocation(g_ctx.dmlInAlloc);
+            if (g_ctx.ortDml && g_ctx.dmlOutAlloc) g_ctx.ortDml->FreeGPUAllocation(g_ctx.dmlOutAlloc);
+            if (g_ctx.hDml) FreeLibrary(g_ctx.hDml);
+            if (g_ctx.fenceEvent) CloseHandle(g_ctx.fenceEvent);
+        }
+        break;
     }
     return TRUE;
 }
