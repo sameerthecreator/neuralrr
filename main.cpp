@@ -12,9 +12,12 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <algorithm>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
+
+using Microsoft::WRL::ComPtr;
 
 constexpr int IN_WIDTH     = 768;
 constexpr int IN_HEIGHT    = 432;
@@ -26,6 +29,7 @@ struct NeuralState {
     std::atomic<bool> initializing{false};
     std::atomic<bool> failed{false};
     std::atomic<bool> running{false};
+    std::atomic<bool> has_new_frame{false};
 
     std::atomic<uint64_t> frame_count{0};
     std::atomic<uint64_t> ai_count{0};
@@ -42,7 +46,13 @@ struct NeuralState {
     const char* outputNames[1] = { "rendered_frame" };
 
     std::vector<float> inputData;
+    std::vector<uint8_t> pixelBufferRGBA;
     std::vector<char> modelBytes;
+
+    // Direct3D 12 texture resources for screen blit
+    ComPtr<ID3D12Device> d3d12Device;
+    reshade::api::resource aiTextureRes = {};
+
     std::wstring moduleDir;
     std::ofstream log;
 };
@@ -60,7 +70,7 @@ static void CleanupORT() {
 
 static void InitDirectMLWorker() {
     if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] Step 1: Worker thread started.\n";
+        g_st.log << "[NeuralShader] Initializing DirectML worker...\n";
         g_st.log.flush();
     }
 
@@ -78,19 +88,13 @@ static void InitDirectMLWorker() {
     g_st.ort->SetSessionGraphOptimizationLevel(g_st.sessionOptions, ORT_ENABLE_BASIC);
 
     SetEnvironmentVariableA("DML_DISABLE_METACMDS", "1");
-
-    if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] Step 2: Appending DirectML execution provider...\n";
-        g_st.log.flush();
-    }
-
     OrtSessionOptionsAppendExecutionProvider_DML(g_st.sessionOptions, 0);
 
     std::wstring modelPath = g_st.moduleDir + L"\\neural_shader_gtx1650_432p.onnx";
     std::ifstream file(modelPath, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
         if (g_st.log.is_open()) {
-            g_st.log << "[NeuralShader] ERROR: Could not open neural_shader_gtx1650_432p.onnx\n";
+            g_st.log << "[NeuralShader] ERROR: Could not open model file: neural_shader_gtx1650_432p.onnx\n";
             g_st.log.flush();
         }
         g_st.failed = true;
@@ -104,11 +108,6 @@ static void InitDirectMLWorker() {
         if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to read model bytes.\n";
         g_st.failed = true;
         return;
-    }
-
-    if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] Step 3: Compiling session from memory (" << size << " bytes)...\n";
-        g_st.log.flush();
     }
 
     OrtStatus* status = g_st.ort->CreateSessionFromArray(
@@ -131,6 +130,8 @@ static void InitDirectMLWorker() {
 
     size_t inElems = (size_t)IN_WIDTH * IN_HEIGHT * IN_CHANNELS;
     g_st.inputData.assign(inElems, 0.5f);
+    g_st.pixelBufferRGBA.resize((size_t)IN_WIDTH * IN_HEIGHT * 4, 255);
+
     g_st.ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &g_st.memInfo);
 
     int64_t inShape[] = { 1, IN_CHANNELS, IN_HEIGHT, IN_WIDTH };
@@ -148,13 +149,31 @@ static void InitDirectMLWorker() {
 }
 
 static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
+    if (g_st.failed) return;
+
     uint64_t current_frame = ++g_st.frame_count;
 
     // Trigger initialization after passing frame 120
-    if (!g_st.ready && !g_st.initializing && !g_st.failed && current_frame > 120) {
+    if (!g_st.ready && !g_st.initializing && current_frame > 120) {
         g_st.initializing = true;
         std::thread(InitDirectMLWorker).detach();
         return;
+    }
+
+    // Lazy create screen texture for AI frames on the swapchain device
+    if (g_st.ready && g_st.aiTextureRes.handle == 0 && swapchain != nullptr) {
+        auto device = swapchain->get_device();
+        reshade::api::resource_desc desc = {};
+        desc.type = reshade::api::resource_type::texture_2d;
+        desc.texture.width = IN_WIDTH;
+        desc.texture.height = IN_HEIGHT;
+        desc.texture.depth_or_layers = 1;
+        desc.texture.levels = 1;
+        desc.texture.format = reshade::api::format::r8g8b8a8_unorm;
+        desc.texture.samples = 1;
+        desc.usage = reshade::api::resource_usage::copy_source | reshade::api::resource_usage::copy_dest;
+
+        device->create_resource(desc, nullptr, reshade::api::resource_usage::copy_dest, &g_st.aiTextureRes);
     }
 
     // Run inference every 2nd frame
@@ -189,17 +208,36 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
                 g_st.failed = true;
             } else {
                 if (outputTensor) {
+                    float* outData = nullptr;
+                    g_st.ort->GetTensorMutableData(outputTensor, reinterpret_cast<void**>(&outData));
+
+                    // Convert AI planar RGB [3, 432, 768] into RGBA8 packed pixels
+                    if (outData != nullptr) {
+                        const int planeSize = IN_WIDTH * IN_HEIGHT;
+                        const float* rPlane = outData;
+                        const float* gPlane = outData + planeSize;
+                        const float* bPlane = outData + 2 * planeSize;
+                        uint8_t* dst = g_st.pixelBufferRGBA.data();
+
+                        for (int i = 0; i < planeSize; ++i) {
+                            dst[i * 4 + 0] = static_cast<uint8_t>(std::clamp(rPlane[i], 0.0f, 1.0f) * 255.0f);
+                            dst[i * 4 + 1] = static_cast<uint8_t>(std::clamp(gPlane[i], 0.0f, 1.0f) * 255.0f);
+                            dst[i * 4 + 2] = static_cast<uint8_t>(std::clamp(bPlane[i], 0.0f, 1.0f) * 255.0f);
+                            dst[i * 4 + 3] = 255;
+                        }
+                        g_st.has_new_frame.store(true);
+                    }
                     g_st.ort->ReleaseValue(outputTensor);
                 }
-                uint64_t ai = ++g_st.ai_count;
 
+                uint64_t ai = ++g_st.ai_count;
                 if (ai % 60 == 0) {
                     char titleBuf[128];
-                    snprintf(titleBuf, sizeof(titleBuf), "Forza Horizon 2 [AI: %llu Frames | %.1f ms]", (unsigned long long)ai, ms);
+                    snprintf(titleBuf, sizeof(titleBuf), "Forza Horizon 2 [AI Output: %llu Frames | %.1f ms]", (unsigned long long)ai, ms);
                     SetConsoleTitleA(titleBuf);
 
                     if (g_st.log.is_open()) {
-                        g_st.log << "[NeuralShader] Rendered AI frames: " << ai << " (Game: " << current_frame << " | " << ms << " ms)\n";
+                        g_st.log << "[NeuralShader] AI Output frame: " << ai << " (Game: " << current_frame << " | " << ms << " ms)\n";
                         g_st.log.flush();
                     }
                 }
@@ -208,36 +246,30 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         }
     }
 
-    // Screen Visual Effect: Render HUD indicator on top of active game frame
-    if (swapchain != nullptr && queue != nullptr) {
-        // If AI is actively running or has failed, draw an on-screen status rectangle
-        if (g_st.ready || g_st.failed) {
-            reshade::api::resource current_backbuffer = swapchain->get_current_back_buffer();
-            reshade::api::resource_view rtv = swapchain->get_device()->get_resource_view(current_backbuffer);
+    // Display the model's output directly on screen
+    if (g_st.has_new_frame.load() && g_st.aiTextureRes.handle != 0 && swapchain != nullptr && queue != nullptr) {
+        auto device = swapchain->get_device();
+        auto cmdList = queue->get_immediate_command_list();
 
-            // Green/Cyan pulse when working normally, Solid Red if failed
-            float color[4];
-            if (g_st.failed) {
-                color[0] = 1.0f; color[1] = 0.0f; color[2] = 0.0f; color[3] = 1.0f; // Red
-            } else {
-                // Subtle pulse effect tied to AI frame count
-                float pulse = 0.6f + 0.4f * sinf(g_st.ai_count.load() * 0.1f);
-                color[0] = 0.0f; color[1] = pulse; color[2] = 0.8f * pulse; color[3] = 1.0f; // Neon Cyan/Green
-            }
+        // 1. Upload the AI pixels to the GPU texture
+        reshade::api::subresource_data subData = {};
+        subData.data = g_st.pixelBufferRGBA.data();
+        subData.row_pitch = IN_WIDTH * 4;
+        subData.slice_pitch = IN_WIDTH * IN_HEIGHT * 4;
 
-            // Top-left HUD box: (left: 20, top: 20, right: 220, bottom: 35)
-            reshade::api::rect hudRect = { 20, 20, 220, 35 };
+        device->update_texture_region(subData, g_st.aiTextureRes, 0, nullptr);
 
-            reshade::api::command_list* cmdList = queue->get_immediate_command_list();
-            if (cmdList != nullptr) {
-                cmdList->clear_render_target_view(rtv, color, 1, &hudRect);
-            }
+        // 2. Blit the AI frame over the active backbuffer
+        reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
+        if (cmdList != nullptr && backbuffer.handle != 0) {
+            reshade::api::box srcBox = { 0, 0, 0, (uint32_t)IN_WIDTH, (uint32_t)IN_HEIGHT, 1 };
+            cmdList->copy_texture_region(g_st.aiTextureRes, 0, &srcBox, backbuffer, 0, nullptr, reshade::api::filter_mode::min_mag_mip_linear);
         }
     }
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (HUD Visual Feed)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML Runtime with Screen Overlay Effect";
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (AI Screen Output)";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML Runtime Displaying AI Rendered Frames";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
