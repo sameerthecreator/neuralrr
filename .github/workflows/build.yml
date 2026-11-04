@@ -23,7 +23,7 @@ jobs:
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@v1
 
-    - name: Download Dependencies (ReShade & ONNX Runtime DirectML)
+    - name: Download Dependencies (ReShade, ORT, DirectML)
       shell: pwsh
       run: |
         # 1. Download ReShade API headers
@@ -37,14 +37,18 @@ jobs:
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_events.hpp" -OutFile "reshade/include/reshade_events.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_overlay.hpp" -OutFile "reshade/include/reshade_overlay.hpp"
 
-        # 2. Download ONNX Runtime with DirectML support (NuGet package)
+        # 2. Download ONNX Runtime (DirectML package)
         Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.17.1" -OutFile "ort_dml.zip"
         Expand-Archive -Path "ort_dml.zip" -DestinationPath "ort_dml_extract"
         New-Item -ItemType Directory -Force -Path "onnxruntime/include"
         New-Item -ItemType Directory -Force -Path "onnxruntime/lib"
         Copy-Item "ort_dml_extract/build/native/include/*" -Destination "onnxruntime/include" -Recurse
         Copy-Item "ort_dml_extract/runtimes/win-x64/native/onnxruntime.dll" -Destination "onnxruntime/lib"
-        Copy-Item "ort_dml_extract/runtimes/win-x64/native/DirectML.dll" -Destination "onnxruntime/lib"
+
+        # 3. Download standalone DirectML runtime DLL
+        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.14.0" -OutFile "dml.zip"
+        Expand-Archive -Path "dml.zip" -DestinationPath "dml_extract"
+        Copy-Item "dml_extract/bin/x64-win/DirectML.dll" -Destination "onnxruntime/lib"
 
     - name: Configure CMake
       run: cmake -B build -DCMAKE_BUILD_TYPE=Release
