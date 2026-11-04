@@ -17,17 +17,27 @@ jobs:
         ref: v6.8.0
         path: reshade_repo
 
-    - name: Download ONNX Runtime DirectML
+    - name: Download ONNX Runtime DirectML & DirectML Core
       shell: pwsh
       run: |
-        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.16.3" -OutFile "onnxruntime.zip"
-        Expand-Archive -Path "onnxruntime.zip" -DestinationPath "nuget_extracted"
+        # 1. Download ONNX Runtime DirectML package
+        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.16.3" -OutFile "ort_dml.zip"
+        Expand-Archive -Path "ort_dml.zip" -DestinationPath "ort_extracted"
         
+        # 2. Download DirectML redistributable DLL package
+        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.13.1" -OutFile "dml.zip"
+        Expand-Archive -Path "dml.zip" -DestinationPath "dml_extracted"
+        
+        # 3. Organize headers and libraries
         New-Item -ItemType Directory -Force -Path "onnxruntime\include"
         New-Item -ItemType Directory -Force -Path "onnxruntime\lib"
         
-        Copy-Item -Path "nuget_extracted\build\native\include\*" -Destination "onnxruntime\include" -Recurse
-        Copy-Item -Path "nuget_extracted\runtimes\win-x64\native\*" -Destination "onnxruntime\lib" -Recurse
+        Copy-Item -Path "ort_extracted\build\native\include\*" -Destination "onnxruntime\include" -Recurse
+        Copy-Item -Path "ort_extracted\runtimes\win-x64\native\*" -Destination "onnxruntime\lib" -Recurse
+        
+        # Copy DirectML.dll into lib and project root
+        Copy-Item -Path "dml_extracted\bin\x64-win\DirectML.dll" -Destination "onnxruntime\lib\DirectML.dll"
+        Copy-Item -Path "dml_extracted\bin\x64-win\DirectML.dll" -Destination ".\DirectML.dll"
 
     - name: Set up MSVC environment
       uses: ilammy/msvc-dev-cmd@v1
@@ -49,9 +59,6 @@ jobs:
           /link /DELAYLOAD:onnxruntime.dll
 
         Copy-Item -Path "onnxruntime\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
-        if (Test-Path "onnxruntime\lib\DirectML.dll") {
-          Copy-Item -Path "onnxruntime\lib\DirectML.dll" -Destination ".\DirectML.dll"
-        }
 
     - name: Upload compiled addon artifacts
       uses: actions/upload-artifact@v4
