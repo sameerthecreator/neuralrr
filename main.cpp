@@ -50,11 +50,13 @@ struct NeuralContext {
     OrtSession* session = nullptr;
     OrtMemoryInfo* memInfo = nullptr;
     OrtValue* inTensor = nullptr;
+    OrtValue* outTensor = nullptr;
 
     const char* inputNames[1]  = { "g_buffer" };
     const char* outputNames[1] = { "rendered_frame" };
 
     std::vector<float> inputData;
+    std::vector<float> outputData;
 
     std::wstring modelDirectory;
     std::ofstream logFile;
@@ -65,7 +67,7 @@ static std::atomic<bool> g_isInferring{false};
 
 static void AsyncInitDirectML() {
     if (g_ctx.logFile.is_open()) {
-        g_ctx.logFile << "[NeuralShader] Background thread initializing on Azimuth's active GPU...\n";
+        g_ctx.logFile << "[NeuralShader] Background thread initializing DirectML on GTX 1650...\n";
         g_ctx.logFile.flush();
     }
 
@@ -78,7 +80,7 @@ static void AsyncInitDirectML() {
 
     auto pfnDMLCreateDevice = reinterpret_cast<PFN_DMLCreateDevice>(GetProcAddress(g_ctx.hDml, "DMLCreateDevice"));
     if (!pfnDMLCreateDevice || FAILED(pfnDMLCreateDevice(g_ctx.d3d12Device.Get(), DML_CREATE_DEVICE_FLAG_NONE, IID_PPV_ARGS(&g_ctx.dmlDevice)))) {
-        if (g_ctx.logFile.is_open()) g_ctx.logFile << "[NeuralShader] ERROR: Failed to create DirectML device on game GPU.\n";
+        if (g_ctx.logFile.is_open()) g_ctx.logFile << "[NeuralShader] ERROR: Failed to create DirectML device.\n";
         g_ctx.has_failed = true;
         return;
     }
@@ -102,8 +104,6 @@ static void AsyncInitDirectML() {
     g_ctx.ort->SetSessionGraphOptimizationLevel(g_ctx.sessionOptions, ORT_ENABLE_BASIC);
 
     SetEnvironmentVariableA("DML_DISABLE_METACMDS", "1");
-
-    // Pass Azimuth's GTX 1650 DML device, with nullptr queue so DML creates its own dedicated queue on the SAME GPU
     g_ctx.ortDml->SessionOptionsAppendExecutionProvider_DML1(g_ctx.sessionOptions, g_ctx.dmlDevice.Get(), nullptr);
 
     std::wstring fullModelPath = g_ctx.modelDirectory + L"\\neural_shader_gtx1650_432p.onnx";
@@ -118,20 +118,29 @@ static void AsyncInitDirectML() {
         return;
     }
 
-    size_t inElements = (size_t)IN_WIDTH * IN_HEIGHT * IN_CHANNELS;
+    // Allocate both input and output buffers cleanly
+    size_t inElements  = (size_t)IN_WIDTH * IN_HEIGHT * IN_CHANNELS;
+    size_t outElements = (size_t)IN_WIDTH * IN_HEIGHT * OUT_CHANNELS;
     g_ctx.inputData.assign(inElements, 0.5f);
+    g_ctx.outputData.assign(outElements, 0.0f);
 
     g_ctx.ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &g_ctx.memInfo);
 
-    int64_t inShape[] = { 1, IN_CHANNELS, IN_HEIGHT, IN_WIDTH };
+    int64_t inShape[]  = { 1, IN_CHANNELS, IN_HEIGHT, IN_WIDTH };
+    int64_t outShape[] = { 1, OUT_CHANNELS, IN_HEIGHT, IN_WIDTH };
 
+    // Pre-allocate both tensors so OrtApi::Run never dereferences null
     g_ctx.ort->CreateTensorWithDataAsOrtValue(
         g_ctx.memInfo, g_ctx.inputData.data(), inElements * sizeof(float),
         inShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &g_ctx.inTensor
     );
+    g_ctx.ort->CreateTensorWithDataAsOrtValue(
+        g_ctx.memInfo, g_ctx.outputData.data(), outElements * sizeof(float),
+        outShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &g_ctx.outTensor
+    );
 
     if (g_ctx.logFile.is_open()) {
-        g_ctx.logFile << "[NeuralShader] DirectML session initialized on GTX 1650 with dedicated queue!\n";
+        g_ctx.logFile << "[NeuralShader] DirectML session initialized successfully on GTX 1650!\n";
         g_ctx.logFile.flush();
     }
 
@@ -144,7 +153,6 @@ static void on_present(reshade::api::command_queue*, reshade::api::swapchain* sw
     if (swapchain->get_device()->get_api() != reshade::api::device_api::d3d12) return;
     if (g_ctx.has_failed) return;
 
-    // Start background thread once the engine is actively rendering frames
     if (!g_ctx.is_ready && !g_ctx.is_loading && frame > 60) {
         g_ctx.is_loading = true;
         g_ctx.d3d12Device = reinterpret_cast<ID3D12Device*>(swapchain->get_device()->get_native());
@@ -155,7 +163,8 @@ static void on_present(reshade::api::command_queue*, reshade::api::swapchain* sw
     if (g_ctx.is_ready && (frame % 2 == 0)) {
         bool expected = false;
         if (g_isInferring.compare_exchange_strong(expected, true)) {
-            OrtValue* outputs[1] = { nullptr };
+            OrtValue* outputs[1] = { g_ctx.outTensor };
+
             OrtStatus* status = g_ctx.ort->Run(
                 g_ctx.session,
                 nullptr,
@@ -175,9 +184,6 @@ static void on_present(reshade::api::command_queue*, reshade::api::swapchain* sw
                 g_ctx.ort->ReleaseStatus(status);
                 g_ctx.has_failed = true;
             } else {
-                if (outputs[0] != nullptr) {
-                    g_ctx.ort->ReleaseValue(outputs[0]);
-                }
                 uint64_t aiCount = ++g_ctx.ai_frames;
                 if (aiCount % 60 == 0 && g_ctx.logFile.is_open()) {
                     g_ctx.logFile << "[NeuralShader] Inferred AI frames: " << aiCount << " (Game frame: " << frame << ")\n";
@@ -189,8 +195,8 @@ static void on_present(reshade::api::command_queue*, reshade::api::swapchain* sw
     }
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (GTX 1650 Dedicated)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Dedicated Queue DirectML Addon for Forza Horizon 2";
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (GTX 1650 Managed)";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML Addon for Forza Horizon 2";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
@@ -219,6 +225,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
 
         if (g_ctx.is_ready) {
             if (g_ctx.inTensor) g_ctx.ort->ReleaseValue(g_ctx.inTensor);
+            if (g_ctx.outTensor) g_ctx.ort->ReleaseValue(g_ctx.outTensor);
             if (g_ctx.memInfo) g_ctx.ort->ReleaseMemoryInfo(g_ctx.memInfo);
             if (g_ctx.session) g_ctx.ort->ReleaseSession(g_ctx.session);
             if (g_ctx.sessionOptions) g_ctx.ort->ReleaseSessionOptions(g_ctx.sessionOptions);
