@@ -39,9 +39,10 @@ jobs:
           /I"reshade_repo\include" `
           /I"onnxruntime\include" `
           onnxruntime\lib\onnxruntime.lib `
-          delayimp.lib `
-          /link /DELAYLOAD:onnxruntime.dll `
+          /link /EXPORT:ReShadePluginInit /EXPORT:ReShadePluginUninstall `
           /Fe:neural_shader.dll
+
+        Copy-Item -Path "onnxruntime\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
 
         Copy-Item -Path "onnxruntime\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
 
