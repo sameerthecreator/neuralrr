@@ -16,6 +16,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         repository: crosire/reshade
+        ref: v6.8.0
         path: reshade_repo
 
     - name: Download ONNX Runtime
@@ -33,7 +34,15 @@ jobs:
     - name: Compile ReShade Addon
       shell: pwsh
       run: |
-        cl.exe /O2 /LD /EHsc /std:c++17 main.cpp /I"." /I"reshade_repo\include" /I"onnxruntime\include" onnxruntime\lib\onnxruntime.lib /Fe:neural_shader.dll
+        cl.exe /O2 /LD /EHsc /std:c++17 main.cpp `
+          /I"." `
+          /I"reshade_repo\include" `
+          /I"onnxruntime\include" `
+          onnxruntime\lib\onnxruntime.lib `
+          delayimp.lib `
+          /link /DELAYLOAD:onnxruntime.dll `
+          /Fe:neural_shader.dll
+
         Copy-Item -Path "onnxruntime\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
 
     - name: Upload compiled addon artifacts
