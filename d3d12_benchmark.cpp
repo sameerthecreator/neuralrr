@@ -93,21 +93,12 @@ int main() {
     if (!inBuffer || !outBuffer) return -1;
 
     // 3. Initialize ONNX Runtime with DirectML
-    // Request API Version 17 so it works on both 1.17 and 1.19 runtimes
-    const OrtApi* ortApiPtr = OrtGetApiBase()->GetApi(17);
-    if (!ortApiPtr) {
-        ortApiPtr = OrtGetApiBase()->GetApi(Ort::GetApi().GetVersion());
-    }
-    const OrtApi& ortApi = *ortApiPtr;
-
+    const OrtApi& ortApi = Ort::GetApi();
     const OrtDmlApi* ortDmlApi = nullptr;
-    ortApi.GetExecutionProviderApi("DML", 17, reinterpret_cast<const void**>(&ortDmlApi));
-    if (!ortDmlApi) {
-        ortApi.GetExecutionProviderApi("DML", ortApi.GetVersion(), reinterpret_cast<const void**>(&ortDmlApi));
-    }
+    ortApi.GetExecutionProviderApi("DML", ORT_API_VERSION, reinterpret_cast<const void**>(&ortDmlApi));
 
     if (!ortDmlApi) {
-        std::cerr << "Error: DirectML execution provider API unavailable on this runtime DLL.\n";
+        std::cerr << "Error: DirectML execution provider API unavailable.\n";
         return -1;
     }
 
@@ -128,7 +119,7 @@ int main() {
     }
     std::cout << "Model loaded successfully!\n\n";
 
-    // 4. Wrap D3D12 VRAM Resources into DirectML Tensors (Zero-Copy)
+    // 4. Wrap D3D12 VRAM Resources into DirectML OrtValue Tensors (Zero-Copy)
     void* dmlInAlloc = nullptr;
     void* dmlOutAlloc = nullptr;
     ortDmlApi->CreateGPUAllocationFromD3DResource(inBuffer.Get(), &dmlInAlloc);
@@ -151,7 +142,6 @@ int main() {
         ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &rawOutVal
     );
 
-    // Wrap raw handles into C++ Ort::Value instances
     Ort::Value inTensor(rawInVal);
     Ort::Value outTensor(rawOutVal);
 
@@ -196,5 +186,7 @@ int main() {
     ortDmlApi->FreeGPUAllocation(dmlInAlloc);
     ortDmlApi->FreeGPUAllocation(dmlOutAlloc);
 
+    std::cout << "Press Enter to exit...";
+    std::cin.get();
     return 0;
 }
