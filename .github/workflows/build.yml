@@ -5,9 +5,14 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 10
 
     steps:
     - name: Checkout Code
@@ -18,7 +23,7 @@ jobs:
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@v1
 
-    - name: Download Dependencies (ReShade, ORT, DirectML)
+    - name: Download Dependencies (ReShade & ONNX Runtime DirectML)
       shell: pwsh
       run: |
         # 1. Download ReShade API headers
@@ -32,21 +37,14 @@ jobs:
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_events.hpp" -OutFile "reshade/include/reshade_events.hpp"
         Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_overlay.hpp" -OutFile "reshade/include/reshade_overlay.hpp"
 
-        # 2. Download ONNX Runtime
-        Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-win-x64-1.17.1.zip" -OutFile "ort.zip"
-        Expand-Archive -Path "ort.zip" -DestinationPath "ort_extract"
+        # 2. Download ONNX Runtime with DirectML support (NuGet package)
+        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.17.1" -OutFile "ort_dml.zip"
+        Expand-Archive -Path "ort_dml.zip" -DestinationPath "ort_dml_extract"
         New-Item -ItemType Directory -Force -Path "onnxruntime/include"
         New-Item -ItemType Directory -Force -Path "onnxruntime/lib"
-        Copy-Item "ort_extract/onnxruntime-win-x64-1.17.1/include/*" -Destination "onnxruntime/include" -Recurse
-        Copy-Item "ort_extract/onnxruntime-win-x64-1.17.1/lib/*" -Destination "onnxruntime/lib" -Recurse
-
-        # 3. Download DirectML
-        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.14.0" -OutFile "dml.zip"
-        Expand-Archive -Path "dml.zip" -DestinationPath "dml_extract"
-        New-Item -ItemType Directory -Force -Path "directml/include"
-        New-Item -ItemType Directory -Force -Path "directml/lib"
-        Copy-Item "dml_extract/include/*" -Destination "directml/include" -Recurse
-        Copy-Item "dml_extract/bin/x64-win/DirectML.dll" -Destination "directml/lib"
+        Copy-Item "ort_dml_extract/build/native/include/*" -Destination "onnxruntime/include" -Recurse
+        Copy-Item "ort_dml_extract/runtimes/win-x64/native/onnxruntime.dll" -Destination "onnxruntime/lib"
+        Copy-Item "ort_dml_extract/runtimes/win-x64/native/DirectML.dll" -Destination "onnxruntime/lib"
 
     - name: Configure CMake
       run: cmake -B build -DCMAKE_BUILD_TYPE=Release
@@ -61,4 +59,4 @@ jobs:
         path: |
           build/Release/neural_shader.addon64
           onnxruntime/lib/onnxruntime.dll
-          directml/lib/DirectML.dll
+          onnxruntime/lib/DirectML.dll
