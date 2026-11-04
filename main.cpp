@@ -102,7 +102,10 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     cmd_list->copy_resource(backbuffer, g_staging_color_read);
 
     // 2. Query and Copy Active Depth Buffer
-    reshade::api::resource depth_buffer = runtime->get_active_depth_stencil();
+    reshade::api::resource depth_buffer = {0};
+    if (runtime != nullptr) {
+        depth_buffer = runtime->get_current_depth_stencil();
+    }
     bool has_depth = false;
 
     if (depth_buffer.handle != 0) {
@@ -159,7 +162,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
             // Channel 3: Depth
             if (depth_row) {
                 float d = depth_row[x];
-                // Linearize/clamp standard reverse-Z / linear depth
                 input_tensor[3 * plane_size + idx] = std::clamp(d, 0.0f, 1.0f);
             } else {
                 input_tensor[3 * plane_size + idx] = 0.5f;
@@ -180,16 +182,15 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
             float dzdx = input_tensor[3 * plane_size + (y * width + x_next)] - input_tensor[3 * plane_size + (y * width + x_prev)];
             float dzdy = input_tensor[3 * plane_size + (y_next * width + x)] - input_tensor[3 * plane_size + (y_prev * width + x)];
 
-            // Normal vector (-dzdx, -dzdy, 1.0) normalized to [0, 1] range
             float nx = -dzdx * 50.0f;
             float ny = -dzdy * 50.0f;
             float nz = 1.0f;
             float len = std::sqrt(nx * nx + ny * ny + nz * nz);
             if (len > 0.0001f) { nx /= len; ny /= len; nz /= len; }
 
-            input_tensor[4 * plane_size + idx] = (nx * 0.5f) + 0.5f; // Normal X
-            input_tensor[5 * plane_size + idx] = (ny * 0.5f) + 0.5f; // Normal Y
-            input_tensor[6 * plane_size + idx] = (nz * 0.5f) + 0.5f; // Normal Z
+            input_tensor[4 * plane_size + idx] = (nx * 0.5f) + 0.5f;
+            input_tensor[5 * plane_size + idx] = (ny * 0.5f) + 0.5f;
+            input_tensor[6 * plane_size + idx] = (nz * 0.5f) + 0.5f;
         }
     }
 
