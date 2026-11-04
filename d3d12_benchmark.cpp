@@ -93,12 +93,21 @@ int main() {
     if (!inBuffer || !outBuffer) return -1;
 
     // 3. Initialize ONNX Runtime with DirectML
-    const OrtApi& ortApi = Ort::GetApi();
+    // Request API Version 17 so it works on both 1.17 and 1.19 runtimes
+    const OrtApi* ortApiPtr = OrtGetApiBase()->GetApi(17);
+    if (!ortApiPtr) {
+        ortApiPtr = OrtGetApiBase()->GetApi(Ort::GetApi().GetVersion());
+    }
+    const OrtApi& ortApi = *ortApiPtr;
+
     const OrtDmlApi* ortDmlApi = nullptr;
-    ortApi.GetExecutionProviderApi("DML", ORT_API_VERSION, reinterpret_cast<const void**>(&ortDmlApi));
+    ortApi.GetExecutionProviderApi("DML", 17, reinterpret_cast<const void**>(&ortDmlApi));
+    if (!ortDmlApi) {
+        ortApi.GetExecutionProviderApi("DML", ortApi.GetVersion(), reinterpret_cast<const void**>(&ortDmlApi));
+    }
 
     if (!ortDmlApi) {
-        std::cerr << "Error: DirectML execution provider API unavailable.\n";
+        std::cerr << "Error: DirectML execution provider API unavailable on this runtime DLL.\n";
         return -1;
     }
 
