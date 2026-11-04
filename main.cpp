@@ -36,6 +36,7 @@ static std::wstring get_addon_directory() {
 }
 
 static void on_init_effect_runtime(reshade::api::effect_runtime* runtime) {
+    if (!runtime) return;
     try {
         if (!g_ort_env) {
             g_ort_env = new Ort::Env(ORT_LOGGING_LEVEL_WARNING, "HDR2SDR_NeuralShader");
@@ -49,65 +50,67 @@ static void on_init_effect_runtime(reshade::api::effect_runtime* runtime) {
         session_options.SetIntraOpNumThreads(4);
         session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
 
+        // Attach DirectML execution provider
         OrtSessionOptionsAppendExecutionProvider_DML(session_options, 0);
 
         std::wstring model_full_path = get_addon_directory() + L"neural_shader_gtx1650_sharp.onnx";
         
-        char path_a[MAX_PATH];
-        WideCharToMultiByte(CP_UTF8, 0, model_full_path.c_str(), -1, path_a, MAX_PATH, NULL, NULL);
-        log_debug(std::string("Attempting to load model from: ") + path_a);
-
         g_ort_session = new Ort::Session(*g_ort_env, model_full_path.c_str(), session_options);
         
         if (!g_memory_info) {
             g_memory_info = new Ort::MemoryInfo(Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU));
         }
 
-        // Query model expected input shapes
-        Ort::AllocatorWithDefaultOptions allocator;
-        size_t num_inputs = g_ort_session->GetInputCount();
-        log_debug("Model loaded successfully! Num inputs: " + std::to_string(num_inputs));
-
-        for (size_t i = 0; i < num_inputs; ++i) {
-            auto input_name = g_ort_session->GetInputNameAllocated(i, allocator);
-            auto type_info = g_ort_session->GetInputTypeInfo(i);
-            auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
-            auto shape = tensor_info.GetShape();
-            std::string shape_str = "Input " + std::string(input_name.get()) + " shape: [";
-            for (auto dim : shape) shape_str += std::to_string(dim) + " ";
-            shape_str += "]";
-            log_debug(shape_str);
-        }
-
+        log_debug("ONNX Model and DirectML loaded successfully!");
         MessageBeep(MB_ICONASTERISK);
-    } catch (const Ort::Exception& oe) {
-        log_debug(std::string("ONNX Exception in init: ") + oe.what());
-        MessageBeep(MB_ICONHAND);
     } catch (const std::exception& e) {
-        log_debug(std::string("Standard Exception in init: ") + e.what());
+        log_debug(std::string("Init Exception: ") + e.what());
         MessageBeep(MB_ICONHAND);
     } catch (...) {
-        log_debug("Unknown Exception in init");
+        log_debug("Unknown Init Exception.");
         MessageBeep(MB_ICONHAND);
     }
 }
 
 static void on_destroy_effect_runtime(reshade::api::effect_runtime* runtime) {
+    if (!runtime) return;
     reshade::api::device* device = runtime->get_device();
-    if (g_staging_color_read.handle != 0) { device->destroy_resource(g_staging_color_read); g_staging_color_read = {0}; }
-    if (g_staging_color_write.handle != 0) { device->destroy_resource(g_staging_color_write); g_staging_color_write = {0}; }
+    if (!device) return;
+
+    if (g_staging_color_read.handle != 0) { 
+        device->destroy_resource(g_staging_color_read); 
+        g_staging_color_read = {0}; 
+    }
+    if (g_staging_color_write.handle != 0) { 
+        device->destroy_resource(g_staging_color_write); 
+        g_staging_color_write = {0}; 
+    }
 }
 
 static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list, reshade::api::resource_view rtv, reshade::api::resource_view) {
+    // Null safety guard against 0x0 access violation
+    if (!runtime || !cmd_list || rtv.handle == 0 || !g_ort_session || !g_memory_info) {
+        return;
+    }
+
     if (GetAsyncKeyState(VK_F10) & 0x0001) {
         g_ai_enabled = !g_ai_enabled;
         MessageBeep(g_ai_enabled ? MB_OK : MB_ICONEXCLAMATION);
-        log_debug(std::string("F10 Pressed: AI is now ") + (g_ai_enabled ? "ON" : "OFF"));
+    }
+    if (GetAsyncKeyState(VK_F11) & 0x0001) {
+        g_ai_multiplier = (std::min)(g_ai_multiplier + 0.5f, 5.0f);
+        MessageBeep(MB_OK);
+    }
+    if (GetAsyncKeyState(VK_F9) & 0x0001) {
+        g_ai_multiplier = (std::max)(g_ai_multiplier - 0.5f, 0.1f);
+        MessageBeep(MB_OK);
     }
 
-    if (!g_ai_enabled || !g_ort_session) return;
+    if (!g_ai_enabled) return;
 
     reshade::api::device* device = runtime->get_device();
+    if (!device) return;
+
     reshade::api::resource target_resource = device->get_resource_from_view(rtv);
     if (target_resource.handle == 0) return;
 
@@ -115,10 +118,16 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, res
     int64_t width = color_desc.texture.width;
     int64_t height = color_desc.texture.height;
 
+    // Validate resource bounds
+    if (width <= 0 || height <= 0 || width > 3840 || height > 2160) return;
+
+    // Allocate or reallocate staging buffers
     if (g_staging_color_read.handle == 0 || device->get_resource_desc(g_staging_color_read).texture.width != width) {
         if (g_staging_color_read.handle != 0) {
             device->destroy_resource(g_staging_color_read);
             device->destroy_resource(g_staging_color_write);
+            g_staging_color_read = {0};
+            g_staging_color_write = {0};
         }
         reshade::api::resource_desc stage_desc = color_desc;
         stage_desc.heap = reshade::api::memory_heap::gpu_to_cpu;
@@ -130,12 +139,16 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, res
         device->create_resource(stage_desc, nullptr, reshade::api::resource_usage::copy_source, &g_staging_color_write);
     }
 
+    if (g_staging_color_read.handle == 0 || g_staging_color_write.handle == 0) return;
+
     cmd_list->copy_resource(target_resource, g_staging_color_read);
-    runtime->get_command_queue()->wait_idle();
+    
+    reshade::api::command_queue* queue = runtime->get_command_queue();
+    if (!queue) return;
+    queue->wait_idle();
 
     reshade::api::subresource_data mapped_color;
     if (!device->map_texture_region(g_staging_color_read, 0, nullptr, reshade::api::map_access::read_only, &mapped_color)) {
-        log_debug("Failed to map staging color read texture!");
         return;
     }
 
@@ -148,7 +161,7 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, res
 
     uint8_t* color_data = static_cast<uint8_t*>(mapped_color.data);
 
-    // Unpack R10G10B10A2
+    // Unpack R10G10B10A2 format
     for (int y = 0; y < height; ++y) {
         uint32_t* row = reinterpret_cast<uint32_t*>(color_data + y * mapped_color.row_pitch);
         for (int x = 0; x < width; ++x) {
@@ -168,25 +181,15 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, res
     std::vector<int64_t> input_dims = {1, input_channels, height, width};
     std::vector<int64_t> output_dims = {1, output_channels, height, width};
 
-    Ort::Value input_tensor_val = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), input_tensor.data(), input_tensor.size(), input_dims.data(), input_dims.size());
-    Ort::Value output_tensor_val = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), output_tensor.data(), output_tensor.size(), output_dims.data(), output_dims.size());
-
-    const char* input_names[] = {"g_buffer"};
-    const char* output_names[] = {"rendered_frame"};
-
     try {
+        Ort::Value input_tensor_val = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), input_tensor.data(), input_tensor.size(), input_dims.data(), input_dims.size());
+        Ort::Value output_tensor_val = Ort::Value::CreateTensor<float>(static_cast<const OrtMemoryInfo*>(*g_memory_info), output_tensor.data(), output_tensor.size(), output_dims.data(), output_dims.size());
+
+        const char* input_names[] = {"g_buffer"};
+        const char* output_names[] = {"rendered_frame"};
+
         g_ort_session->Run(Ort::RunOptions{nullptr}, input_names, &input_tensor_val, 1, output_names, &output_tensor_val, 1);
-    } catch (const Ort::Exception& oe) {
-        static int error_count = 0;
-        if (error_count++ < 3) {
-            log_debug(std::string("ONNX Run Error: ") + oe.what());
-        }
-        return;
     } catch (...) {
-        static int error_count2 = 0;
-        if (error_count2++ < 3) {
-            log_debug("ONNX Run Error: Unknown exception");
-        }
         return;
     }
 
@@ -223,7 +226,7 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, res
 }
 
 extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (HDR2SDR)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "7-Channel HDR2SDR ONNX Hook";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML 7-Channel HDR2SDR";
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
