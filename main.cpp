@@ -40,6 +40,7 @@ struct NeuralContext {
     std::atomic<uint64_t> ai_frames{0};
 
     ComPtr<ID3D12Device> d3d12Device;
+    ComPtr<ID3D12CommandQueue> dedicatedDmlQueue;
     HMODULE hDml = nullptr;
     ComPtr<IDMLDevice> dmlDevice;
 
@@ -67,10 +68,25 @@ static std::atomic<bool> g_isInferring{false};
 
 static void AsyncInitDirectML() {
     if (g_ctx.logFile.is_open()) {
-        g_ctx.logFile << "[NeuralShader] Background thread initializing DirectML on GTX 1650...\n";
+        g_ctx.logFile << "[NeuralShader] Background thread initializing on GTX 1650...\n";
         g_ctx.logFile.flush();
     }
 
+    // 1. Create a dedicated Direct D3D12 Command Queue on the GTX 1650 for DirectML
+    D3D12_COMMAND_QUEUE_DESC queueDesc = {};
+    queueDesc.Type     = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    queueDesc.Priority = D3D12_COMMAND_QUEUE_PRIORITY_NORMAL;
+    queueDesc.Flags    = D3D12_COMMAND_QUEUE_FLAG_NONE;
+    queueDesc.NodeMask = 0;
+
+    HRESULT hr = g_ctx.d3d12Device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&g_ctx.dedicatedDmlQueue));
+    if (FAILED(hr)) {
+        if (g_ctx.logFile.is_open()) g_ctx.logFile << "[NeuralShader] ERROR: Failed to create dedicated D3D12 queue for DirectML.\n";
+        g_ctx.has_failed = true;
+        return;
+    }
+
+    // 2. Load DirectML runtime
     g_ctx.hDml = LoadLibraryA("DirectML.dll");
     if (!g_ctx.hDml) {
         if (g_ctx.logFile.is_open()) g_ctx.logFile << "[NeuralShader] ERROR: Failed to load DirectML.dll\n";
@@ -85,6 +101,7 @@ static void AsyncInitDirectML() {
         return;
     }
 
+    // 3. Initialize ORT environment
     const OrtApiBase* apiBase = OrtGetApiBase();
     g_ctx.ort = apiBase->GetApi(17);
     if (!g_ctx.ort) {
@@ -104,7 +121,13 @@ static void AsyncInitDirectML() {
     g_ctx.ort->SetSessionGraphOptimizationLevel(g_ctx.sessionOptions, ORT_ENABLE_BASIC);
 
     SetEnvironmentVariableA("DML_DISABLE_METACMDS", "1");
-    g_ctx.ortDml->SessionOptionsAppendExecutionProvider_DML1(g_ctx.sessionOptions, g_ctx.dmlDevice.Get(), nullptr);
+
+    // Pass valid dmlDevice AND valid dedicated command queue (never nullptr)
+    g_ctx.ortDml->SessionOptionsAppendExecutionProvider_DML1(
+        g_ctx.sessionOptions,
+        g_ctx.dmlDevice.Get(),
+        g_ctx.dedicatedDmlQueue.Get()
+    );
 
     std::wstring fullModelPath = g_ctx.modelDirectory + L"\\neural_shader_gtx1650_432p.onnx";
     OrtStatus* status = g_ctx.ort->CreateSession(g_ctx.env, fullModelPath.c_str(), g_ctx.sessionOptions, &g_ctx.session);
@@ -118,7 +141,7 @@ static void AsyncInitDirectML() {
         return;
     }
 
-    // Allocate both input and output buffers cleanly
+    // 4. Allocate memory buffers
     size_t inElements  = (size_t)IN_WIDTH * IN_HEIGHT * IN_CHANNELS;
     size_t outElements = (size_t)IN_WIDTH * IN_HEIGHT * OUT_CHANNELS;
     g_ctx.inputData.assign(inElements, 0.5f);
@@ -129,7 +152,6 @@ static void AsyncInitDirectML() {
     int64_t inShape[]  = { 1, IN_CHANNELS, IN_HEIGHT, IN_WIDTH };
     int64_t outShape[] = { 1, OUT_CHANNELS, IN_HEIGHT, IN_WIDTH };
 
-    // Pre-allocate both tensors so OrtApi::Run never dereferences null
     g_ctx.ort->CreateTensorWithDataAsOrtValue(
         g_ctx.memInfo, g_ctx.inputData.data(), inElements * sizeof(float),
         inShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &g_ctx.inTensor
@@ -140,7 +162,7 @@ static void AsyncInitDirectML() {
     );
 
     if (g_ctx.logFile.is_open()) {
-        g_ctx.logFile << "[NeuralShader] DirectML session initialized successfully on GTX 1650!\n";
+        g_ctx.logFile << "[NeuralShader] DirectML session initialized on dedicated GTX 1650 queue!\n";
         g_ctx.logFile.flush();
     }
 
@@ -195,8 +217,8 @@ static void on_present(reshade::api::command_queue*, reshade::api::swapchain* sw
     }
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (GTX 1650 Managed)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML Addon for Forza Horizon 2";
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (GTX 1650 Dedicated Queue)";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "Dedicated Queue DirectML Addon for Forza Horizon 2";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
