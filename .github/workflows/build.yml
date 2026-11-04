@@ -36,6 +36,10 @@ jobs:
       shell: pwsh
       run: |
         cl.exe /O2 /LD /EHsc /std:c++17 main.cpp `
+          reshade_repo\deps\imgui\imgui.cpp `
+          reshade_repo\deps\imgui\imgui_draw.cpp `
+          reshade_repo\deps\imgui\imgui_widgets.cpp `
+          reshade_repo\deps\imgui\imgui_tables.cpp `
           /I"." `
           /I"reshade_repo\include" `
           /I"reshade_repo\deps\imgui" `
