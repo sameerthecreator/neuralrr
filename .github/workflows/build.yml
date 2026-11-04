@@ -39,7 +39,9 @@ jobs:
           main.cpp `
           /I"." `
           /I"reshade_repo\include" `
+          /I"reshade_repo\deps\imgui" `
           /I"onnxruntime\include" `
+          /I"onnxruntime\include\core\providers\dml" `
           onnxruntime\lib\onnxruntime.lib `
           delayimp.lib `
           /link /DELAYLOAD:onnxruntime.dll
