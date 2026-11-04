@@ -2,7 +2,6 @@ name: Build ReShade Addon
 
 on:
   push:
-    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
@@ -19,7 +18,7 @@ jobs:
         repository: crosire/reshade
         path: reshade_repo
 
-    - name: Download and extract ONNX Runtime
+    - name: Download ONNX Runtime
       shell: pwsh
       run: |
         Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.16.1/onnxruntime-win-x64-1.16.1.zip" -OutFile "onnxruntime.zip"
@@ -34,13 +33,7 @@ jobs:
     - name: Compile ReShade Addon
       shell: pwsh
       run: |
-        cl.exe /O2 /LD /EHsc /std:c++17 main.cpp `
-          /I"." `
-          /I"reshade_repo\include" `
-          /I"onnxruntime\include" `
-          onnxruntime\lib\onnxruntime.lib `
-          /Fe:neural_shader.dll
-
+        cl.exe /O2 /LD /EHsc /std:c++17 main.cpp /I"." /I"reshade_repo\include" /I"onnxruntime\include" onnxruntime\lib\onnxruntime.lib /Fe:neural_shader.dll
         Copy-Item -Path "onnxruntime\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
 
     - name: Upload compiled addon artifacts
