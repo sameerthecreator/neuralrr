@@ -166,6 +166,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
             reshade::unregister_overlay("Neural Shader", on_draw_settings);
             reshade::unregister_addon(hModule);
             break;
+        
     }
     return TRUE;
 }
