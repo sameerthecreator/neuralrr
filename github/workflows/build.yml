@@ -18,6 +18,7 @@ jobs:
         repository: crosire/reshade
         ref: v6.8.0
         path: reshade_repo
+        submodules: true
 
     - name: Download ONNX Runtime
       shell: pwsh
@@ -43,8 +44,6 @@ jobs:
           delayimp.lib `
           /link /DELAYLOAD:onnxruntime.dll /EXPORT:ReShadePluginInit /EXPORT:ReShadePluginUninstall `
           /Fe:neural_shader.dll
-
-        Copy-Item -Path "onnxruntime\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
 
         Copy-Item -Path "onnxruntime\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
 
