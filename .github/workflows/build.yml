@@ -18,9 +18,21 @@ jobs:
     - name: Setup MSVC
       uses: ilammy/msvc-dev-cmd@v1
 
-    - name: Download ONNX Runtime & DirectML Headers/Libs
+    - name: Download Dependencies (ReShade, ORT, DirectML)
       shell: pwsh
       run: |
+        # 1. Download ReShade API headers
+        New-Item -ItemType Directory -Force -Path "reshade/include"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade.hpp" -OutFile "reshade/include/reshade.hpp"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api.hpp" -OutFile "reshade/include/reshade_api.hpp"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_device.hpp" -OutFile "reshade/include/reshade_api_device.hpp"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_format.hpp" -OutFile "reshade/include/reshade_api_format.hpp"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_pipeline.hpp" -OutFile "reshade/include/reshade_api_pipeline.hpp"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_api_resource.hpp" -OutFile "reshade/include/reshade_api_resource.hpp"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_events.hpp" -OutFile "reshade/include/reshade_events.hpp"
+        Invoke-WebRequest -Uri "https://raw.githubusercontent.com/crosire/reshade/main/include/reshade_overlay.hpp" -OutFile "reshade/include/reshade_overlay.hpp"
+
+        # 2. Download ONNX Runtime
         Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-win-x64-1.17.1.zip" -OutFile "ort.zip"
         Expand-Archive -Path "ort.zip" -DestinationPath "ort_extract"
         New-Item -ItemType Directory -Force -Path "onnxruntime/include"
@@ -28,12 +40,12 @@ jobs:
         Copy-Item "ort_extract/onnxruntime-win-x64-1.17.1/include/*" -Destination "onnxruntime/include" -Recurse
         Copy-Item "ort_extract/onnxruntime-win-x64-1.17.1/lib/*" -Destination "onnxruntime/lib" -Recurse
 
+        # 3. Download DirectML
         Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.14.0" -OutFile "dml.zip"
         Expand-Archive -Path "dml.zip" -DestinationPath "dml_extract"
         New-Item -ItemType Directory -Force -Path "directml/include"
         New-Item -ItemType Directory -Force -Path "directml/lib"
         Copy-Item "dml_extract/include/*" -Destination "directml/include" -Recurse
-        Copy-Item "dml_extract/bin/x64-win/DirectML.lib" -Destination "directml/lib"
         Copy-Item "dml_extract/bin/x64-win/DirectML.dll" -Destination "directml/lib"
 
     - name: Configure CMake
