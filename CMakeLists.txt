@@ -70,6 +70,7 @@ target_include_directories(d3d12_benchmark PRIVATE
 
 target_link_libraries(d3d12_benchmark PRIVATE
     onnxruntime_dml_lib
+    "${ORT_LIB_DIR}/DirectML.lib"
     d3d12.lib
     dxgi.lib
 )
