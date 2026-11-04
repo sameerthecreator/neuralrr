@@ -49,8 +49,6 @@ struct NeuralState {
     std::vector<uint8_t> pixelBufferRGBA;
     std::vector<char> modelBytes;
 
-    // Direct3D 12 texture resources for screen blit
-    ComPtr<ID3D12Device> d3d12Device;
     reshade::api::resource aiTextureRes = {};
 
     std::wstring moduleDir;
@@ -211,7 +209,7 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
                     float* outData = nullptr;
                     g_st.ort->GetTensorMutableData(outputTensor, reinterpret_cast<void**>(&outData));
 
-                    // Convert AI planar RGB [3, 432, 768] into RGBA8 packed pixels
+                    // Convert AI planar RGB [3, 432, 768] into packed RGBA8
                     if (outData != nullptr) {
                         const int planeSize = IN_WIDTH * IN_HEIGHT;
                         const float* rPlane = outData;
@@ -262,8 +260,19 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         // 2. Blit the AI frame over the active backbuffer
         reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
         if (cmdList != nullptr && backbuffer.handle != 0) {
-            reshade::api::box srcBox = { 0, 0, 0, (uint32_t)IN_WIDTH, (uint32_t)IN_HEIGHT, 1 };
-            cmdList->copy_texture_region(g_st.aiTextureRes, 0, &srcBox, backbuffer, 0, nullptr, reshade::api::filter_mode::min_mag_mip_linear);
+            reshade::api::subresource_box srcBox = {};
+            srcBox.left   = 0;
+            srcBox.top    = 0;
+            srcBox.front  = 0;
+            srcBox.right  = static_cast<uint32_t>(IN_WIDTH);
+            srcBox.bottom = static_cast<uint32_t>(IN_HEIGHT);
+            srcBox.back   = 1;
+
+            cmdList->copy_texture_region(
+                g_st.aiTextureRes, 0, &srcBox,
+                backbuffer, 0, nullptr,
+                reshade::api::filter_mode::min_mag_mip_linear
+            );
         }
     }
 }
