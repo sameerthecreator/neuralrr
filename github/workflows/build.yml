@@ -1,40 +1,52 @@
 name: Build ReShade Addon
 
-on: [push]
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
 
     steps:
-    - name: Checkout code
+    - name: Checkout repository
       uses: actions/checkout@v4
 
-    - name: Clone ReShade Headers
+    - name: Clone ReShade headers
       uses: actions/checkout@v4
       with:
         repository: crosire/reshade
         path: reshade_repo
 
-    - name: Download ONNX Runtime
+    - name: Download and extract ONNX Runtime
+      shell: pwsh
       run: |
         Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.16.1/onnxruntime-win-x64-1.16.1.zip" -OutFile "onnxruntime.zip"
         Expand-Archive -Path "onnxruntime.zip" -DestinationPath "."
-        Rename-Item "onnxruntime-win-x64-1.16.1" "onnxruntime"
+        Rename-Item -Path "onnxruntime-win-x64-1.16.1" -NewName "onnxruntime"
 
-    - name: Set up MSVC Developer Command Prompt
+    - name: Set up MSVC environment
       uses: ilammy/msvc-dev-cmd@v1
       with:
         arch: x64
 
-    - name: Compile ReShade Add-on DLL
+    - name: Compile ReShade Addon
+      shell: pwsh
       run: |
-        cl.exe /O2 /LD /EHsc /std:c++17 main.cpp /I"." /I"reshade_repo\include" /I"onnxruntime\include" onnxruntime\lib\onnxruntime.lib /Fe:neural_shader.dll
+        cl.exe /O2 /LD /EHsc /std:c++17 main.cpp `
+          /I"." `
+          /I"reshade_repo\include" `
+          /I"onnxruntime\include" `
+          onnxruntime\lib\onnxruntime.lib `
+          /Fe:neural_shader.dll
 
-    - name: Upload Artifact
+        Copy-Item -Path "onnxruntime\lib\onnxruntime.dll" -Destination ".\onnxruntime.dll"
+
+    - name: Upload compiled addon artifacts
       uses: actions/upload-artifact@v4
       with:
         name: neural_shader_addon
         path: |
           neural_shader.dll
-          onnxruntime\lib\onnxruntime.dll
+          onnxruntime.dll
