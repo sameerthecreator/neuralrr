@@ -4,7 +4,7 @@
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
-#include <onnxruntime_cxx_api.h>
+#include <onnxruntime_c_api.h>
 #include <dml_provider_factory.h>
 
 #pragma comment(lib, "d3d12.lib")
@@ -92,72 +92,79 @@ int main() {
 
     if (!inBuffer || !outBuffer) return -1;
 
-    // 3. Initialize ONNX Runtime with DirectML
-    const OrtApi& ortApi = Ort::GetApi();
-    const OrtDmlApi* ortDmlApi = nullptr;
-    ortApi.GetExecutionProviderApi("DML", ORT_API_VERSION, reinterpret_cast<const void**>(&ortDmlApi));
-
-    if (!ortDmlApi) {
-        std::cerr << "Error: DirectML execution provider API unavailable.\n";
+    // 3. Connect to ORT API Version 17
+    const OrtApiBase* apiBase = OrtGetApiBase();
+    const OrtApi* ort = apiBase->GetApi(17);
+    if (!ort) {
+        std::cerr << "Error: Could not obtain OrtApi version 17.\n";
         return -1;
     }
 
-    Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "DirectML_Benchmark");
-    Ort::SessionOptions sessionOptions;
-    sessionOptions.SetIntraOpNumThreads(4);
-    sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_EXTENDED);
+    const OrtDmlApi* ortDmlApi = nullptr;
+    ort->GetExecutionProviderApi("DML", 17, reinterpret_cast<const void**>(&ortDmlApi));
+    if (!ortDmlApi) {
+        std::cerr << "Error: DirectML execution provider unavailable.\n";
+        return -1;
+    }
+
+    OrtEnv* env = nullptr;
+    ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "DirectML_Benchmark", &env);
+
+    OrtSessionOptions* sessionOptions = nullptr;
+    ort->CreateSessionOptions(&sessionOptions);
+    ort->SetIntraOpNumThreads(sessionOptions, 4);
+    ort->SetSessionGraphOptimizationLevel(sessionOptions, ORT_ENABLE_EXTENDED);
     OrtSessionOptionsAppendExecutionProvider_DML(sessionOptions, 0);
 
     const wchar_t* modelPath = L"neural_shader_gtx1650_sharp.onnx";
     std::cout << "Loading ONNX model graph into DirectML...\n";
-    Ort::Session session(nullptr);
-    try {
-        session = Ort::Session(env, modelPath, sessionOptions);
-    } catch (const Ort::Exception& e) {
-        std::cerr << "Model load error: " << e.what() << "\n";
+    OrtSession* session = nullptr;
+    OrtStatus* status = ort->CreateSession(env, modelPath, sessionOptions, &session);
+    if (status != nullptr) {
+        std::cerr << "Model load error: " << ort->GetErrorMessage(status) << "\n";
+        ort->ReleaseStatus(status);
         return -1;
     }
     std::cout << "Model loaded successfully!\n\n";
 
-    // 4. Wrap D3D12 VRAM Resources into DirectML OrtValue Tensors (Zero-Copy)
+    // 4. Wrap D3D12 VRAM Resources into DirectML Tensors (Zero-Copy)
     void* dmlInAlloc = nullptr;
     void* dmlOutAlloc = nullptr;
     ortDmlApi->CreateGPUAllocationFromD3DResource(inBuffer.Get(), &dmlInAlloc);
     ortDmlApi->CreateGPUAllocationFromD3DResource(outBuffer.Get(), &dmlOutAlloc);
 
     OrtMemoryInfo* dmlMemInfo = nullptr;
-    ortApi.CreateMemoryInfo("DML", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemType::OrtMemTypeDefault, &dmlMemInfo);
+    ort->CreateMemoryInfo("DML", OrtDeviceAllocator, 0, OrtMemTypeDefault, &dmlMemInfo);
 
     int64_t inShape[] = { 1, IN_CHANNELS, HEIGHT, WIDTH };
-    OrtValue* rawInVal = nullptr;
-    ortApi.CreateTensorWithDataAsOrtValue(
+    OrtValue* inTensor = nullptr;
+    ort->CreateTensorWithDataAsOrtValue(
         dmlMemInfo, dmlInAlloc, inBytes, inShape, 4,
-        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &rawInVal
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &inTensor
     );
 
     int64_t outShape[] = { 1, OUT_CHANNELS, HEIGHT, WIDTH };
-    OrtValue* rawOutVal = nullptr;
-    ortApi.CreateTensorWithDataAsOrtValue(
+    OrtValue* outTensor = nullptr;
+    ort->CreateTensorWithDataAsOrtValue(
         dmlMemInfo, dmlOutAlloc, outBytes, outShape, 4,
-        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &rawOutVal
+        ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &outTensor
     );
 
-    Ort::Value inTensor(rawInVal);
-    Ort::Value outTensor(rawOutVal);
+    // 5. Setup IOBinding
+    OrtIoBinding* ioBinding = nullptr;
+    ort->CreateIoBinding(session, &ioBinding);
+    ort->BindInput(ioBinding, "g_buffer", inTensor);
+    ort->BindOutput(ioBinding, "rendered_frame", outTensor);
 
-    // 5. Setup IOBinding (Locks tensors to DirectML GPU queue)
-    Ort::IoBinding ioBinding(session);
-    ioBinding.BindInput("g_buffer", inTensor);
-    ioBinding.BindOutput("rendered_frame", outTensor);
+    OrtRunOptions* runOptions = nullptr;
+    ort->CreateRunOptions(&runOptions);
 
-    Ort::RunOptions runOptions;
-
-    // 6. Warmup Run (Compiles the DirectML kernel execution plans on GPU)
+    // 6. Warmup Run
     std::cout << "Warming up DirectML pipeline on GPU...\n";
-    try {
-        session.Run(runOptions, ioBinding);
-    } catch (const Ort::Exception& e) {
-        std::cerr << "Warmup error: " << e.what() << "\n";
+    status = ort->RunWithBinding(session, runOptions, ioBinding);
+    if (status != nullptr) {
+        std::cerr << "Warmup error: " << ort->GetErrorMessage(status) << "\n";
+        ort->ReleaseStatus(status);
         return -1;
     }
     std::cout << "Warmup successful!\n\n";
@@ -168,7 +175,7 @@ int main() {
 
     const int iterations = 50;
     for (int i = 0; i < iterations; ++i) {
-        session.Run(runOptions, ioBinding);
+        ort->RunWithBinding(session, runOptions, ioBinding);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -181,8 +188,15 @@ int main() {
     std::cout << "Maximum Potential FPS:  " << fps << " FPS\n";
     std::cout << "====================================================\n\n";
 
-    // Cleanup allocations
-    ortApi.ReleaseMemoryInfo(dmlMemInfo);
+    // Cleanup
+    ort->ReleaseIoBinding(ioBinding);
+    ort->ReleaseRunOptions(runOptions);
+    ort->ReleaseValue(inTensor);
+    ort->ReleaseValue(outTensor);
+    ort->ReleaseMemoryInfo(dmlMemInfo);
+    ort->ReleaseSession(session);
+    ort->ReleaseSessionOptions(sessionOptions);
+    ort->ReleaseEnv(env);
     ortDmlApi->FreeGPUAllocation(dmlInAlloc);
     ortDmlApi->FreeGPUAllocation(dmlOutAlloc);
 
