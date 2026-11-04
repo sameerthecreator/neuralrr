@@ -35,7 +35,7 @@ static std::wstring get_addon_directory() {
     return (pos != std::wstring::npos) ? str_path.substr(0, pos + 1) : L"";
 }
 
-static void on_init_swapchain(reshade::api::swapchain* swapchain) {
+static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize_only) {
     if (!swapchain || g_ort_session) return;
     try {
         if (!g_ort_env) {
@@ -67,7 +67,7 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain) {
     }
 }
 
-static void on_destroy_swapchain(reshade::api::swapchain* swapchain) {
+static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool resize_only) {
     if (!swapchain) return;
     reshade::api::device* device = swapchain->get_device();
     if (!device) return;
@@ -104,7 +104,7 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
 
     // Lazy load session if not created during init
     if (!g_ort_session) {
-        on_init_swapchain(swapchain);
+        on_init_swapchain(swapchain, false);
         if (!g_ort_session) return;
     }
 
