@@ -1,0 +1,38 @@
+name: Build ReShade Addon
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Clone ReShade Headers
+      uses: actions/checkout@v4
+      with:
+        repository: crosire/reshade
+        path: reshade_repo
+
+    - name: Download ONNX Runtime
+      run: |
+        Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.16.1/onnxruntime-win-x64-1.16.1.zip" -OutFile "onnxruntime.zip"
+        Expand-Archive -Path "onnxruntime.zip" -DestinationPath "."
+        Rename-Item "onnxruntime-win-x64-1.16.1" "onnxruntime"
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v3
+
+    - name: Compile via Visual Studio MSBuild Compiler
+      run: |
+        cmd.exe /c "\"C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat\" x64 && cl.exe /LD main.cpp /I"." /I"reshade_repo\include" /I"onnxruntime\include" onnxruntime\lib\onnxruntime.lib /Fe:neural_shader.dll"
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: neural_shader_addon
+        path: |
+          neural_shader.dll
+          onnxruntime.dll
