@@ -39,6 +39,7 @@ extern "C" __declspec(dllexport) bool ReShadePluginInit(void* hmodule) {
 
 extern "C" __declspec(dllexport) void ReShadePluginUninstall(void* hmodule) {
     HMODULE addon_mod = static_cast<HMODULE>(hmodule);
+    
     reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
     reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
     reshade::unregister_addon(addon_mod);
