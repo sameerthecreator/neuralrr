@@ -19,12 +19,12 @@ jobs:
         ref: v6.8.0
         path: reshade_repo
 
-    - name: Download ONNX Runtime
+    - name: Download ONNX Runtime DirectML
       shell: pwsh
       run: |
-        Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.16.1/onnxruntime-win-x64-1.16.1.zip" -OutFile "onnxruntime.zip"
+        Invoke-WebRequest -Uri "https://github.com/microsoft/onnxruntime/releases/download/v1.16.1/onnxruntime-win-x64-directml-1.16.1.zip" -OutFile "onnxruntime.zip"
         Expand-Archive -Path "onnxruntime.zip" -DestinationPath "."
-        Rename-Item -Path "onnxruntime-win-x64-1.16.1" -NewName "onnxruntime"
+        Rename-Item -Path "onnxruntime-win-x64-directml-1.16.1" -NewName "onnxruntime"
 
     - name: Set up MSVC environment
       uses: ilammy/msvc-dev-cmd@v1
@@ -39,9 +39,7 @@ jobs:
           main.cpp `
           /I"." `
           /I"reshade_repo\include" `
-          /I"reshade_repo\deps\imgui" `
           /I"onnxruntime\include" `
-          /I"onnxruntime\include\core\providers\dml" `
           onnxruntime\lib\onnxruntime.lib `
           delayimp.lib `
           /link /DELAYLOAD:onnxruntime.dll
