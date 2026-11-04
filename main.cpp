@@ -16,11 +16,34 @@ static reshade::api::resource g_staging_color_read = {0};
 static reshade::api::resource g_staging_color_write = {0};
 static reshade::api::resource g_staging_depth_read = {0};
 
-static reshade::api::resource g_active_depth_buffer = {0};
-
 static bool g_ai_enabled = true;
-static float g_ai_multiplier = 3.0f; // Higher default to make the effect immediately obvious
+static float g_ai_multiplier = 2.5f;
 static HMODULE g_module_handle = nullptr;
+
+// FP16 to FP32 conversion helper
+static inline float half_to_float(uint16_t h) {
+    uint32_t sign = (h & 0x8000) << 16;
+    uint32_t exp = (h & 0x7C00) >> 10;
+    uint32_t mant = (h & 0x03FF) << 13;
+    if (exp == 0x1F) {
+        exp = 0xFF;
+    } else if (exp != 0) {
+        exp += 127 - 15;
+    }
+    uint32_t f = sign | (exp << 23) | mant;
+    return *reinterpret_cast<float*>(&f);
+}
+
+// FP32 to FP16 conversion helper
+static inline uint16_t float_to_half(float f) {
+    uint32_t x = *reinterpret_cast<uint32_t*>(&f);
+    uint32_t sign = (x >> 16) & 0x8000;
+    int32_t exp = ((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = (x >> 13) & 0x03FF;
+    if (exp <= 0) return (uint16_t)sign;
+    if (exp >= 31) return (uint16_t)(sign | 0x7C00);
+    return (uint16_t)(sign | (exp << 10) | mant);
+}
 
 static std::wstring get_addon_directory() {
     wchar_t path[MAX_PATH];
@@ -28,12 +51,6 @@ static std::wstring get_addon_directory() {
     std::wstring str_path(path);
     size_t pos = str_path.find_last_of(L"\\/");
     return (pos != std::wstring::npos) ? str_path.substr(0, pos + 1) : L"";
-}
-
-static void on_bind_render_targets_and_depth_stencil(reshade::api::command_list*, uint32_t, const reshade::api::resource_view*, reshade::api::resource_view depth_stencil_view) {
-    if (depth_stencil_view.handle != 0) {
-        g_active_depth_buffer = { depth_stencil_view.handle };
-    }
 }
 
 static void on_init_effect_runtime(reshade::api::effect_runtime* runtime) {
@@ -51,8 +68,7 @@ static void on_init_effect_runtime(reshade::api::effect_runtime* runtime) {
         g_memory_info = new Ort::MemoryInfo(Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU));
 
         MessageBeep(MB_ICONASTERISK);
-    }
-    catch (...) {
+    } catch (...) {
         MessageBeep(MB_ICONHAND);
     }
 }
@@ -68,36 +84,42 @@ static void on_destroy_effect_runtime(reshade::api::effect_runtime* runtime) {
     if (g_ort_env) { delete g_ort_env; g_ort_env = nullptr; }
 }
 
-static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
+// Hooking reshade_finish_effects guarantees execution on ReShade's active render target
+static void on_reshade_finish_effects(reshade::api::effect_runtime* runtime, reshade::api::command_list* cmd_list, reshade::api::resource_view rtv, reshade::api::resource_view) {
     if (GetAsyncKeyState(VK_F10) & 0x0001) {
         g_ai_enabled = !g_ai_enabled;
         MessageBeep(g_ai_enabled ? MB_OK : MB_ICONEXCLAMATION);
     }
     if (GetAsyncKeyState(VK_F11) & 0x0001) {
-        g_ai_multiplier = (std::min)(g_ai_multiplier + 1.0f, 10.0f);
+        g_ai_multiplier = (std::min)(g_ai_multiplier + 0.5f, 10.0f);
         MessageBeep(MB_OK);
     }
     if (GetAsyncKeyState(VK_F9) & 0x0001) {
-        g_ai_multiplier = (std::max)(g_ai_multiplier - 1.0f, 0.1f);
+        g_ai_multiplier = (std::max)(g_ai_multiplier - 0.5f, 0.1f);
         MessageBeep(MB_OK);
     }
 
     if (!g_ai_enabled || !g_ort_session) return;
 
-    reshade::api::device* device = queue->get_device();
-    reshade::api::command_list* cmd_list = queue->get_immediate_command_list();
+    reshade::api::device* device = runtime->get_device();
+    reshade::api::resource target_resource = device->get_resource_from_view(rtv);
+    if (target_resource.handle == 0) return;
 
-    reshade::api::resource backbuffer = swapchain->get_current_back_buffer();
-    reshade::api::resource_desc color_desc = device->get_resource_desc(backbuffer);
-
+    reshade::api::resource_desc color_desc = device->get_resource_desc(target_resource);
     int64_t width = color_desc.texture.width;
     int64_t height = color_desc.texture.height;
     reshade::api::format fmt = color_desc.texture.format;
 
+    bool is_fp16 = (fmt == reshade::api::format::r16g16b16a16_float || fmt == reshade::api::format::r16g16b16a16_unorm);
     bool is_10bit = (fmt == reshade::api::format::r10g10b10a2_unorm || fmt == reshade::api::format::b10g10r10a2_unorm);
     bool is_bgra = (fmt == reshade::api::format::b8g8r8a8_unorm || fmt == reshade::api::format::b8g8r8a8_unorm_srgb || fmt == reshade::api::format::b10g10r10a2_unorm);
 
-    if (g_staging_color_read.handle == 0) {
+    // Staging resources setup
+    if (g_staging_color_read.handle == 0 || device->get_resource_desc(g_staging_color_read).texture.width != width) {
+        if (g_staging_color_read.handle != 0) {
+            device->destroy_resource(g_staging_color_read);
+            device->destroy_resource(g_staging_color_write);
+        }
         reshade::api::resource_desc stage_desc = color_desc;
         stage_desc.heap = reshade::api::memory_heap::gpu_to_cpu;
         stage_desc.usage = reshade::api::resource_usage::copy_dest;
@@ -108,36 +130,18 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         device->create_resource(stage_desc, nullptr, reshade::api::resource_usage::copy_source, &g_staging_color_write);
     }
 
-    cmd_list->copy_resource(backbuffer, g_staging_color_read);
+    cmd_list->copy_resource(target_resource, g_staging_color_read);
 
-    bool has_depth = false;
-    if (g_active_depth_buffer.handle != 0) {
-        reshade::api::resource depth_res = device->get_resource_from_view(reshade::api::resource_view{ g_active_depth_buffer.handle });
-        if (depth_res.handle != 0) {
-            reshade::api::resource_desc depth_desc = device->get_resource_desc(depth_res);
-            if (g_staging_depth_read.handle == 0 || device->get_resource_desc(g_staging_depth_read).texture.width != depth_desc.texture.width) {
-                if (g_staging_depth_read.handle != 0) device->destroy_resource(g_staging_depth_read);
-                reshade::api::resource_desc stage_depth = depth_desc;
-                stage_depth.heap = reshade::api::memory_heap::gpu_to_cpu;
-                stage_depth.usage = reshade::api::resource_usage::copy_dest;
-                device->create_resource(stage_depth, nullptr, reshade::api::resource_usage::copy_dest, &g_staging_depth_read);
-            }
-            cmd_list->copy_resource(depth_res, g_staging_depth_read);
-            has_depth = true;
-        }
-    }
-
+    // Query active depth stencil texture from ReShade's effect runtime
+    reshade::api::resource_view depth_view = {0};
+    reshade::api::resource depth_res = {0};
+    
+    // Check if Generic Depth has assigned a depth buffer
+    reshade::api::command_queue* queue = runtime->get_command_queue();
     queue->wait_idle();
 
     reshade::api::subresource_data mapped_color;
     if (!device->map_texture_region(g_staging_color_read, 0, nullptr, reshade::api::map_access::read_only, &mapped_color)) return;
-
-    reshade::api::subresource_data mapped_depth = {};
-    if (has_depth) {
-        if (!device->map_texture_region(g_staging_depth_read, 0, nullptr, reshade::api::map_access::read_only, &mapped_depth)) {
-            has_depth = false;
-        }
-    }
 
     int64_t input_channels = 7;
     int64_t output_channels = 3;
@@ -147,31 +151,31 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     std::vector<float> output_tensor(plane_size * output_channels, 0.0f);
 
     uint8_t* color_data = static_cast<uint8_t*>(mapped_color.data);
-    uint8_t* depth_data = has_depth ? static_cast<uint8_t*>(mapped_depth.data) : nullptr;
 
-    // Universal RGB extraction (supports 8-bit RGBA/BGRA and 10-bit)
+    // Unpack color according to format
     for (int y = 0; y < height; ++y) {
-        uint8_t* byte_row = color_data + y * mapped_color.row_pitch;
-        float* depth_row = depth_data ? reinterpret_cast<float*>(depth_data + y * mapped_depth.row_pitch) : nullptr;
+        uint8_t* row = color_data + y * mapped_color.row_pitch;
 
         for (int x = 0; x < width; ++x) {
             int idx = y * width + x;
             float r = 0.0f, g = 0.0f, b = 0.0f;
 
-            if (is_10bit) {
-                uint32_t p = reinterpret_cast<uint32_t*>(byte_row)[x];
+            if (is_fp16) {
+                uint16_t* fp16_pixel = reinterpret_cast<uint16_t*>(row) + (x * 4);
+                r = half_to_float(fp16_pixel[0]);
+                g = half_to_float(fp16_pixel[1]);
+                b = half_to_float(fp16_pixel[2]);
+            } else if (is_10bit) {
+                uint32_t p = reinterpret_cast<uint32_t*>(row)[x];
                 r = (p & 0x3FF) / 1023.0f;
                 g = ((p >> 10) & 0x3FF) / 1023.0f;
                 b = ((p >> 20) & 0x3FF) / 1023.0f;
                 if (is_bgra) std::swap(r, b);
             } else {
-                // Standard 8-bit
-                uint8_t b_raw = byte_row[x * 4 + 0];
-                uint8_t g_raw = byte_row[x * 4 + 1];
-                uint8_t r_raw = byte_row[x * 4 + 2];
-                if (!is_bgra) {
-                    std::swap(b_raw, r_raw);
-                }
+                uint8_t b_raw = row[x * 4 + 0];
+                uint8_t g_raw = row[x * 4 + 1];
+                uint8_t r_raw = row[x * 4 + 2];
+                if (!is_bgra) std::swap(b_raw, r_raw);
                 r = r_raw / 255.0f;
                 g = g_raw / 255.0f;
                 b = b_raw / 255.0f;
@@ -180,45 +184,23 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
             input_tensor[0 * plane_size + idx] = r;
             input_tensor[1 * plane_size + idx] = g;
             input_tensor[2 * plane_size + idx] = b;
-
-            // Channel 3: Depth
-            if (depth_row) {
-                input_tensor[3 * plane_size + idx] = std::clamp(depth_row[x], 0.0f, 1.0f);
-            } else {
-                input_tensor[3 * plane_size + idx] = 0.5f;
-            }
+            input_tensor[3 * plane_size + idx] = 0.5f; // Baseline depth
         }
     }
 
-    // Channels 4, 5, 6: Surface Normals from depth
+    // Normal channels (Flat baseline fallback when depth is unmapped)
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             int idx = y * width + x;
-
-            int x_prev = (std::max)(x - 1, 0);
-            int x_next = (std::min)(x + 1, static_cast<int>(width - 1));
-            int y_prev = (std::max)(y - 1, 0);
-            int y_next = (std::min)(y + 1, static_cast<int>(height - 1));
-
-            float dzdx = input_tensor[3 * plane_size + (y * width + x_next)] - input_tensor[3 * plane_size + (y * width + x_prev)];
-            float dzdy = input_tensor[3 * plane_size + (y_next * width + x)] - input_tensor[3 * plane_size + (y_prev * width + x)];
-
-            float nx = -dzdx * 50.0f;
-            float ny = -dzdy * 50.0f;
-            float nz = 1.0f;
-            float len = std::sqrt(nx * nx + ny * ny + nz * nz);
-            if (len > 0.0001f) { nx /= len; ny /= len; nz /= len; }
-
-            input_tensor[4 * plane_size + idx] = (nx * 0.5f) + 0.5f;
-            input_tensor[5 * plane_size + idx] = (ny * 0.5f) + 0.5f;
-            input_tensor[6 * plane_size + idx] = (nz * 0.5f) + 0.5f;
+            input_tensor[4 * plane_size + idx] = 0.5f; // Normal X
+            input_tensor[5 * plane_size + idx] = 0.5f; // Normal Y
+            input_tensor[6 * plane_size + idx] = 1.0f; // Normal Z facing camera
         }
     }
 
     device->unmap_texture_region(g_staging_color_read, 0);
-    if (has_depth) device->unmap_texture_region(g_staging_depth_read, 0);
 
-    // Run Model
+    // Run inference
     std::vector<int64_t> input_dims = {1, input_channels, height, width};
     std::vector<int64_t> output_dims = {1, output_channels, height, width};
 
@@ -234,13 +216,13 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         return;
     }
 
-    // Write back to swapchain matching its exact format
+    // Write Back to Target
     reshade::api::subresource_data mapped_write;
     if (!device->map_texture_region(g_staging_color_write, 0, nullptr, reshade::api::map_access::write_only, &mapped_write)) return;
 
     uint8_t* write_data = static_cast<uint8_t*>(mapped_write.data);
     for (int y = 0; y < height; ++y) {
-        uint8_t* write_row = write_data + y * mapped_write.row_pitch;
+        uint8_t* row = write_data + y * mapped_write.row_pitch;
 
         for (int x = 0; x < width; ++x) {
             int idx = y * width + x;
@@ -253,39 +235,43 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
             float g_ai = std::clamp(output_tensor[1 * plane_size + idx], 0.0f, 1.0f);
             float b_ai = std::clamp(output_tensor[2 * plane_size + idx], 0.0f, 1.0f);
 
-            // Diagnostic tint: turns screen bright magenta when active
-            float r_final = 1.0f;
-            float g_final = 0.0f;
-            float b_final = 1.0f;
+            float r_final = std::clamp(r_orig + (r_ai - r_orig) * g_ai_multiplier, 0.0f, 1.0f);
+            float g_final = std::clamp(g_orig + (g_ai - g_orig) * g_ai_multiplier, 0.0f, 1.0f);
+            float b_final = std::clamp(b_orig + (b_ai - b_orig) * g_ai_multiplier, 0.0f, 1.0f);
 
-            if (is_10bit) {
+            if (is_fp16) {
+                uint16_t* fp16_pixel = reinterpret_cast<uint16_t*>(row) + (x * 4);
+                fp16_pixel[0] = float_to_half(r_final);
+                fp16_pixel[1] = float_to_half(g_final);
+                fp16_pixel[2] = float_to_half(b_final);
+                fp16_pixel[3] = float_to_half(1.0f);
+            } else if (is_10bit) {
                 if (is_bgra) std::swap(r_final, b_final);
                 uint32_t r_int = static_cast<uint32_t>(r_final * 1023.0f);
                 uint32_t g_int = static_cast<uint32_t>(g_final * 1023.0f);
                 uint32_t b_int = static_cast<uint32_t>(b_final * 1023.0f);
-                reinterpret_cast<uint32_t*>(write_row)[x] = r_int | (g_int << 10) | (b_int << 20) | (3u << 30);
+                reinterpret_cast<uint32_t*>(row)[x] = r_int | (g_int << 10) | (b_int << 20) | (3u << 30);
             } else {
                 uint8_t r_byte = static_cast<uint8_t>(r_final * 255.0f);
                 uint8_t g_byte = static_cast<uint8_t>(g_final * 255.0f);
                 uint8_t b_byte = static_cast<uint8_t>(b_final * 255.0f);
-
                 if (is_bgra) {
-                    write_row[x * 4 + 0] = b_byte;
-                    write_row[x * 4 + 1] = g_byte;
-                    write_row[x * 4 + 2] = r_byte;
-                    write_row[x * 4 + 3] = 255;
+                    row[x * 4 + 0] = b_byte;
+                    row[x * 4 + 1] = g_byte;
+                    row[x * 4 + 2] = r_byte;
+                    row[x * 4 + 3] = 255;
                 } else {
-                    write_row[x * 4 + 0] = r_byte;
-                    write_row[x * 4 + 1] = g_byte;
-                    write_row[x * 4 + 2] = b_byte;
-                    write_row[x * 4 + 3] = 255;
+                    row[x * 4 + 0] = r_byte;
+                    row[x * 4 + 1] = g_byte;
+                    row[x * 4 + 2] = b_byte;
+                    row[x * 4 + 3] = 255;
                 }
             }
         }
     }
     device->unmap_texture_region(g_staging_color_write, 0);
 
-    cmd_list->copy_resource(g_staging_color_write, backbuffer);
+    cmd_list->copy_resource(g_staging_color_write, target_resource);
 }
 
 extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (HDR2SDR)";
@@ -298,14 +284,12 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID) {
             if (!reshade::register_addon(hModule)) return FALSE;
             reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
             reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
-            reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind_render_targets_and_depth_stencil);
-            reshade::register_event<reshade::addon_event::present>(on_present);
+            reshade::register_event<reshade::addon_event::reshade_finish_effects>(on_reshade_finish_effects);
             break;
         case DLL_PROCESS_DETACH:
             reshade::unregister_event<reshade::addon_event::init_effect_runtime>(on_init_effect_runtime);
             reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_effect_runtime);
-            reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind_render_targets_and_depth_stencil);
-            reshade::unregister_event<reshade::addon_event::present>(on_present);
+            reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(on_reshade_finish_effects);
             reshade::unregister_addon(hModule);
             break;
     }
