@@ -20,12 +20,12 @@ jobs:
     - name: Download ONNX Runtime DirectML & DirectML Core
       shell: pwsh
       run: |
-        # 1. Download ONNX Runtime DirectML package
-        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.16.3" -OutFile "ort_dml.zip"
+        # 1. Download ONNX Runtime DirectML 1.19.2 (Supports IR Version 10)
+        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.DirectML/1.19.2" -OutFile "ort_dml.zip"
         Expand-Archive -Path "ort_dml.zip" -DestinationPath "ort_extracted"
         
-        # 2. Download DirectML redistributable DLL package
-        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.13.1" -OutFile "dml.zip"
+        # 2. Download DirectML redistributable DLL package (1.15.1)
+        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.AI.DirectML/1.15.1" -OutFile "dml.zip"
         Expand-Archive -Path "dml.zip" -DestinationPath "dml_extracted"
         
         # 3. Organize headers and libraries
@@ -35,7 +35,6 @@ jobs:
         Copy-Item -Path "ort_extracted\build\native\include\*" -Destination "onnxruntime\include" -Recurse
         Copy-Item -Path "ort_extracted\runtimes\win-x64\native\*" -Destination "onnxruntime\lib" -Recurse
         
-        # Copy DirectML.dll into lib and project root
         Copy-Item -Path "dml_extracted\bin\x64-win\DirectML.dll" -Destination "onnxruntime\lib\DirectML.dll"
         Copy-Item -Path "dml_extracted\bin\x64-win\DirectML.dll" -Destination ".\DirectML.dll"
 
