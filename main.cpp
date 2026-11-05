@@ -17,8 +17,6 @@
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
 
-using Microsoft::WRL::ComPtr;
-
 constexpr int IN_WIDTH     = 768;
 constexpr int IN_HEIGHT    = 432;
 constexpr int IN_CHANNELS  = 7;
@@ -31,9 +29,17 @@ struct NeuralState {
     std::atomic<bool> ready{false};
     std::atomic<bool> initializing{false};
     std::atomic<bool> failed{false};
+    
+    // Transition and Thread Safety
     std::atomic<bool> should_exit{false};
     std::atomic<bool> trigger_inference{false};
+    std::atomic<bool> is_paused{false};
     std::atomic<bool> has_new_frame{false};
+    
+    std::mutex queueMutex;
+    std::condition_variable cv;
+    std::mutex inferMutex; // Locks GPU execution during swapchain teardown
+    std::thread workerThread;
 
     std::atomic<uint64_t> frame_count{0};
     std::atomic<uint64_t> ai_count{0};
@@ -55,10 +61,6 @@ struct NeuralState {
     std::vector<float> inputData;
     std::vector<uint8_t> pixelBufferRGBA;
     std::vector<char> modelBytes;
-
-    std::mutex queueMutex;
-    std::condition_variable cv;
-    std::thread workerThread;
 
     reshade::api::resource aiTextureRes = {};
 
@@ -86,7 +88,7 @@ static void CleanupORT() {
 
 static void InferenceLoop() {
     if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] Inference thread active and standing by.\n";
+        g_st.log << "[NeuralShader] Inference thread active.\n";
         g_st.log.flush();
     }
 
@@ -96,6 +98,14 @@ static void InferenceLoop() {
 
         if (g_st.should_exit) break;
         g_st.trigger_inference = false;
+
+        if (g_st.is_paused) continue;
+
+        // Lock inference so the swapchain cannot be destroyed while DirectML is computing
+        std::lock_guard<std::mutex> inferLock(g_st.inferMutex);
+
+        // Double check pause state after acquiring lock
+        if (g_st.is_paused) continue;
 
         OrtValue* outputTensor = nullptr;
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -153,7 +163,7 @@ static void InferenceLoop() {
                 SetConsoleTitleA(titleBuf);
 
                 if (g_st.log.is_open()) {
-                    g_st.log << "[NeuralShader] AI Output frame: " << ai << " (Latency: " << ms << " ms)\n";
+                    g_st.log << "[NeuralShader] Output frame: " << ai << " (Latency: " << ms << " ms)\n";
                     g_st.log.flush();
                 }
             }
@@ -162,11 +172,6 @@ static void InferenceLoop() {
 }
 
 static void InitDirectMLWorker() {
-    if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] Dynamically loading onnxruntime.dll...\n";
-        g_st.log.flush();
-    }
-
     g_st.hOrt = LoadLibraryA("onnxruntime.dll");
     if (!g_st.hOrt) {
         if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to load onnxruntime.dll\n";
@@ -175,20 +180,16 @@ static void InitDirectMLWorker() {
     }
 
     auto pfnGetApiBase = reinterpret_cast<PFN_OrtGetApiBase>(GetProcAddress(g_st.hOrt, "OrtGetApiBase"));
+    g_st.pfnAppendDml = reinterpret_cast<PFN_OrtSessionOptionsAppendExecutionProvider_DML>(GetProcAddress(g_st.hOrt, "OrtSessionOptionsAppendExecutionProvider_DML"));
+
     if (!pfnGetApiBase) {
-        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to find OrtGetApiBase in DLL\n";
         g_st.failed = true;
         return;
     }
 
-    g_st.pfnAppendDml = reinterpret_cast<PFN_OrtSessionOptionsAppendExecutionProvider_DML>(
-        GetProcAddress(g_st.hOrt, "OrtSessionOptionsAppendExecutionProvider_DML")
-    );
-
     const OrtApiBase* apiBase = pfnGetApiBase();
     g_st.ort = apiBase->GetApi(17);
     if (!g_st.ort) {
-        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to get OrtApi version 17\n";
         g_st.failed = true;
         return;
     }
@@ -196,9 +197,12 @@ static void InitDirectMLWorker() {
     g_st.ort->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "Azimuth_Inference", &g_st.env);
     g_st.ort->CreateSessionOptions(&g_st.sessionOptions);
     g_st.ort->SetIntraOpNumThreads(g_st.sessionOptions, 1);
+    
+    // VRAM Optimization for 4GB GTX 1650: Disable Arena to prevent Out-of-Memory TDR during loading screens
+    g_st.ort->DisableCpuMemArena(g_st.sessionOptions);
+    g_st.ort->DisableMemPattern(g_st.sessionOptions);
     g_st.ort->SetSessionGraphOptimizationLevel(g_st.sessionOptions, ORT_ENABLE_BASIC);
 
-    // CRITICAL FIX: DO NOT disable MetaCommands. Let NVIDIA hardware compute kernels natively.
     if (g_st.pfnAppendDml) {
         g_st.pfnAppendDml(g_st.sessionOptions, 0);
     }
@@ -206,7 +210,6 @@ static void InitDirectMLWorker() {
     std::wstring modelPath = g_st.moduleDir + L"\\neural_shader_gtx1650_432p.onnx";
     std::ifstream file(modelPath, std::ios::binary | std::ios::ate);
     if (!file.is_open()) {
-        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Could not open neural_shader_gtx1650_432p.onnx\n";
         g_st.failed = true;
         return;
     }
@@ -214,25 +217,13 @@ static void InitDirectMLWorker() {
     std::streamsize size = file.tellg();
     file.seekg(0, std::ios::beg);
     g_st.modelBytes.resize(size);
-    if (!file.read(g_st.modelBytes.data(), size)) {
-        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to read model file\n";
-        g_st.failed = true;
-        return;
-    }
+    file.read(g_st.modelBytes.data(), size);
 
     OrtStatus* status = g_st.ort->CreateSessionFromArray(
-        g_st.env,
-        g_st.modelBytes.data(),
-        g_st.modelBytes.size(),
-        g_st.sessionOptions,
-        &g_st.session
+        g_st.env, g_st.modelBytes.data(), g_st.modelBytes.size(), g_st.sessionOptions, &g_st.session
     );
 
     if (status != nullptr) {
-        if (g_st.log.is_open()) {
-            g_st.log << "[NeuralShader] ERROR: CreateSessionFromArray failed: " << g_st.ort->GetErrorMessage(status) << "\n";
-            g_st.log.flush();
-        }
         g_st.ort->ReleaseStatus(status);
         g_st.failed = true;
         return;
@@ -250,30 +241,56 @@ static void InitDirectMLWorker() {
         inShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &g_st.inTensor
     );
 
-    // Launch background worker thread for non-blocking asynchronous inference
     g_st.workerThread = std::thread(InferenceLoop);
 
     if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] DirectML active on GTX 1650! Hardware MetaCommands enabled.\n";
+        g_st.log << "[NeuralShader] DirectML active on GTX 1650. Protections enabled.\n";
         g_st.log.flush();
     }
 
     g_st.ready = true;
 }
 
+// Safely resume inference when swapchain builds
+static void on_init_swapchain(reshade::api::swapchain* swapchain) {
+    g_st.is_paused = false;
+    if (g_st.log.is_open()) {
+        g_st.log << "[NeuralShader] Swapchain initialized. Resuming.\n";
+        g_st.log.flush();
+    }
+}
+
+// Safely pause inference and destroy textures when game hits loading screens
+static void on_destroy_swapchain(reshade::api::swapchain* swapchain) {
+    g_st.is_paused = true;
+    
+    // Block until the active AI frame finishes computing to prevent TDR
+    std::lock_guard<std::mutex> inferLock(g_st.inferMutex);
+
+    if (g_st.aiTextureRes.handle != 0 && swapchain != nullptr) {
+        swapchain->get_device()->destroy_resource(g_st.aiTextureRes);
+        g_st.aiTextureRes = {};
+        g_st.has_new_frame = false;
+    }
+
+    if (g_st.log.is_open()) {
+        g_st.log << "[NeuralShader] Swapchain destroyed. Inference paused safely.\n";
+        g_st.log.flush();
+    }
+}
+
 static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
-    if (g_st.failed) return;
+    if (g_st.failed || g_st.is_paused) return;
 
     uint64_t current_frame = ++g_st.frame_count;
 
-    // Wait until past the main loading screen (frame 300) before initializing
     if (!g_st.ready && !g_st.initializing && current_frame > 300) {
         g_st.initializing = true;
         std::thread(InitDirectMLWorker).detach();
         return;
     }
 
-    // Lazy create RGBA8 texture for model frames
+    // Lazy create screen texture safely
     if (g_st.ready && g_st.aiTextureRes.handle == 0 && swapchain != nullptr) {
         auto device = swapchain->get_device();
         reshade::api::resource_desc desc = {};
@@ -289,13 +306,13 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         device->create_resource(desc, nullptr, reshade::api::resource_usage::copy_dest, &g_st.aiTextureRes);
     }
 
-    // Trigger non-blocking inference on alternate frames
+    // Wake the inference thread without blocking the game
     if (g_st.ready && (current_frame % 2 == 0) && !g_st.trigger_inference.load()) {
         g_st.trigger_inference = true;
         g_st.cv.notify_one();
     }
 
-    // Blit the latest ready AI frame to the screen
+    // Blit active frame
     if (g_st.has_new_frame.load() && g_st.aiTextureRes.handle != 0 && swapchain != nullptr && queue != nullptr) {
         auto device = swapchain->get_device();
         auto cmdList = queue->get_immediate_command_list();
@@ -326,8 +343,8 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     }
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (GTX 1650 Async DirectML)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "TDR-Safe DirectML Runtime for Forza Horizon 2";
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (Ultimate TDR Fix)";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "Async DirectML Runtime with Transition Safety";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
@@ -345,11 +362,15 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
         }
 
         if (!reshade::register_addon(hinstDLL)) return FALSE;
+        reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
+        reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
         reshade::register_event<reshade::addon_event::present>(on_present);
         break;
     }
     case DLL_PROCESS_DETACH:
         reshade::unregister_event<reshade::addon_event::present>(on_present);
+        reshade::unregister_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);
+        reshade::unregister_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::unregister_addon(hinstDLL);
         CleanupORT();
         if (g_st.log.is_open()) {
