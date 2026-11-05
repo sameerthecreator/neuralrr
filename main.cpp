@@ -30,7 +30,6 @@ struct NeuralState {
     std::atomic<bool> initializing{false};
     std::atomic<bool> failed{false};
     
-    // Transition and Thread Safety
     std::atomic<bool> should_exit{false};
     std::atomic<bool> trigger_inference{false};
     std::atomic<bool> is_paused{false};
@@ -38,7 +37,7 @@ struct NeuralState {
     
     std::mutex queueMutex;
     std::condition_variable cv;
-    std::mutex inferMutex; // Locks GPU execution during swapchain teardown
+    std::mutex inferMutex;
     std::thread workerThread;
 
     std::atomic<uint64_t> frame_count{0};
@@ -101,10 +100,8 @@ static void InferenceLoop() {
 
         if (g_st.is_paused) continue;
 
-        // Lock inference so the swapchain cannot be destroyed while DirectML is computing
         std::lock_guard<std::mutex> inferLock(g_st.inferMutex);
 
-        // Double check pause state after acquiring lock
         if (g_st.is_paused) continue;
 
         OrtValue* outputTensor = nullptr;
@@ -198,7 +195,6 @@ static void InitDirectMLWorker() {
     g_st.ort->CreateSessionOptions(&g_st.sessionOptions);
     g_st.ort->SetIntraOpNumThreads(g_st.sessionOptions, 1);
     
-    // VRAM Optimization for 4GB GTX 1650: Disable Arena to prevent Out-of-Memory TDR during loading screens
     g_st.ort->DisableCpuMemArena(g_st.sessionOptions);
     g_st.ort->DisableMemPattern(g_st.sessionOptions);
     g_st.ort->SetSessionGraphOptimizationLevel(g_st.sessionOptions, ORT_ENABLE_BASIC);
@@ -251,8 +247,8 @@ static void InitDirectMLWorker() {
     g_st.ready = true;
 }
 
-// Safely resume inference when swapchain builds
-static void on_init_swapchain(reshade::api::swapchain* swapchain) {
+// Added the missing 'bool resize' parameter here
+static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
     g_st.is_paused = false;
     if (g_st.log.is_open()) {
         g_st.log << "[NeuralShader] Swapchain initialized. Resuming.\n";
@@ -260,11 +256,10 @@ static void on_init_swapchain(reshade::api::swapchain* swapchain) {
     }
 }
 
-// Safely pause inference and destroy textures when game hits loading screens
-static void on_destroy_swapchain(reshade::api::swapchain* swapchain) {
+// Added the missing 'bool resize' parameter here
+static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool resize) {
     g_st.is_paused = true;
     
-    // Block until the active AI frame finishes computing to prevent TDR
     std::lock_guard<std::mutex> inferLock(g_st.inferMutex);
 
     if (g_st.aiTextureRes.handle != 0 && swapchain != nullptr) {
@@ -290,7 +285,6 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         return;
     }
 
-    // Lazy create screen texture safely
     if (g_st.ready && g_st.aiTextureRes.handle == 0 && swapchain != nullptr) {
         auto device = swapchain->get_device();
         reshade::api::resource_desc desc = {};
@@ -306,13 +300,11 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         device->create_resource(desc, nullptr, reshade::api::resource_usage::copy_dest, &g_st.aiTextureRes);
     }
 
-    // Wake the inference thread without blocking the game
     if (g_st.ready && (current_frame % 2 == 0) && !g_st.trigger_inference.load()) {
         g_st.trigger_inference = true;
         g_st.cv.notify_one();
     }
 
-    // Blit active frame
     if (g_st.has_new_frame.load() && g_st.aiTextureRes.handle != 0 && swapchain != nullptr && queue != nullptr) {
         auto device = swapchain->get_device();
         auto cmdList = queue->get_immediate_command_list();
@@ -343,7 +335,7 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     }
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (Ultimate TDR Fix)";
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (AI Screen Output)";
 extern "C" __declspec(dllexport) const char* DESCRIPTION = "Async DirectML Runtime with Transition Safety";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
