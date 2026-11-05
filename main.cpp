@@ -11,6 +11,8 @@
 #include <thread>
 #include <chrono>
 #include <algorithm>
+#include <mutex>
+#include <condition_variable>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
@@ -29,7 +31,8 @@ struct NeuralState {
     std::atomic<bool> ready{false};
     std::atomic<bool> initializing{false};
     std::atomic<bool> failed{false};
-    std::atomic<bool> running{false};
+    std::atomic<bool> should_exit{false};
+    std::atomic<bool> trigger_inference{false};
     std::atomic<bool> has_new_frame{false};
 
     std::atomic<uint64_t> frame_count{0};
@@ -53,6 +56,10 @@ struct NeuralState {
     std::vector<uint8_t> pixelBufferRGBA;
     std::vector<char> modelBytes;
 
+    std::mutex queueMutex;
+    std::condition_variable cv;
+    std::thread workerThread;
+
     reshade::api::resource aiTextureRes = {};
 
     std::wstring moduleDir;
@@ -62,6 +69,12 @@ struct NeuralState {
 static NeuralState g_st;
 
 static void CleanupORT() {
+    g_st.should_exit = true;
+    g_st.cv.notify_all();
+    if (g_st.workerThread.joinable()) {
+        g_st.workerThread.join();
+    }
+
     g_st.ready = false;
     if (g_st.inTensor && g_st.ort) { g_st.ort->ReleaseValue(g_st.inTensor); g_st.inTensor = nullptr; }
     if (g_st.memInfo && g_st.ort)  { g_st.ort->ReleaseMemoryInfo(g_st.memInfo); g_st.memInfo = nullptr; }
@@ -69,6 +82,83 @@ static void CleanupORT() {
     if (g_st.sessionOptions && g_st.ort) { g_st.ort->ReleaseSessionOptions(g_st.sessionOptions); g_st.sessionOptions = nullptr; }
     if (g_st.env && g_st.ort)      { g_st.ort->ReleaseEnv(g_st.env); g_st.env = nullptr; }
     if (g_st.hOrt)                 { FreeLibrary(g_st.hOrt); g_st.hOrt = nullptr; }
+}
+
+static void InferenceLoop() {
+    if (g_st.log.is_open()) {
+        g_st.log << "[NeuralShader] Inference thread active and standing by.\n";
+        g_st.log.flush();
+    }
+
+    while (!g_st.should_exit) {
+        std::unique_lock<std::mutex> lock(g_st.queueMutex);
+        g_st.cv.wait(lock, [] { return g_st.trigger_inference.load() || g_st.should_exit.load(); });
+
+        if (g_st.should_exit) break;
+        g_st.trigger_inference = false;
+
+        OrtValue* outputTensor = nullptr;
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        OrtStatus* status = g_st.ort->Run(
+            g_st.session,
+            nullptr,
+            g_st.inputNames,
+            (const OrtValue* const*)&g_st.inTensor,
+            1,
+            g_st.outputNames,
+            1,
+            &outputTensor
+        );
+
+        auto t1 = std::chrono::high_resolution_clock::now();
+        float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
+        g_st.last_ai_ms.store(ms);
+
+        if (status != nullptr) {
+            if (g_st.log.is_open()) {
+                g_st.log << "[NeuralShader] Inference error: " << g_st.ort->GetErrorMessage(status) << "\n";
+                g_st.log.flush();
+            }
+            g_st.ort->ReleaseStatus(status);
+            g_st.failed = true;
+            break;
+        } else {
+            if (outputTensor) {
+                float* outData = nullptr;
+                g_st.ort->GetTensorMutableData(outputTensor, reinterpret_cast<void**>(&outData));
+
+                if (outData != nullptr) {
+                    const int planeSize = IN_WIDTH * IN_HEIGHT;
+                    const float* rPlane = outData;
+                    const float* gPlane = outData + planeSize;
+                    const float* bPlane = outData + 2 * planeSize;
+                    uint8_t* dst = g_st.pixelBufferRGBA.data();
+
+                    for (int i = 0; i < planeSize; ++i) {
+                        dst[i * 4 + 0] = static_cast<uint8_t>(std::clamp(rPlane[i], 0.0f, 1.0f) * 255.0f);
+                        dst[i * 4 + 1] = static_cast<uint8_t>(std::clamp(gPlane[i], 0.0f, 1.0f) * 255.0f);
+                        dst[i * 4 + 2] = static_cast<uint8_t>(std::clamp(bPlane[i], 0.0f, 1.0f) * 255.0f);
+                        dst[i * 4 + 3] = 255;
+                    }
+                    g_st.has_new_frame.store(true);
+                }
+                g_st.ort->ReleaseValue(outputTensor);
+            }
+
+            uint64_t ai = ++g_st.ai_count;
+            if (ai % 60 == 0) {
+                char titleBuf[128];
+                snprintf(titleBuf, sizeof(titleBuf), "Forza Horizon 2 [AI Frames: %llu | %.1f ms]", (unsigned long long)ai, ms);
+                SetConsoleTitleA(titleBuf);
+
+                if (g_st.log.is_open()) {
+                    g_st.log << "[NeuralShader] AI Output frame: " << ai << " (Latency: " << ms << " ms)\n";
+                    g_st.log.flush();
+                }
+            }
+        }
+    }
 }
 
 static void InitDirectMLWorker() {
@@ -108,7 +198,7 @@ static void InitDirectMLWorker() {
     g_st.ort->SetIntraOpNumThreads(g_st.sessionOptions, 1);
     g_st.ort->SetSessionGraphOptimizationLevel(g_st.sessionOptions, ORT_ENABLE_BASIC);
 
-    SetEnvironmentVariableA("DML_DISABLE_METACMDS", "1");
+    // CRITICAL FIX: DO NOT disable MetaCommands. Let NVIDIA hardware compute kernels natively.
     if (g_st.pfnAppendDml) {
         g_st.pfnAppendDml(g_st.sessionOptions, 0);
     }
@@ -160,8 +250,11 @@ static void InitDirectMLWorker() {
         inShape, 4, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &g_st.inTensor
     );
 
+    // Launch background worker thread for non-blocking asynchronous inference
+    g_st.workerThread = std::thread(InferenceLoop);
+
     if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] DirectML active on GTX 1650! Displaying AI rendered frames.\n";
+        g_st.log << "[NeuralShader] DirectML active on GTX 1650! Hardware MetaCommands enabled.\n";
         g_st.log.flush();
     }
 
@@ -173,7 +266,8 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
 
     uint64_t current_frame = ++g_st.frame_count;
 
-    if (!g_st.ready && !g_st.initializing && current_frame > 120) {
+    // Wait until past the main loading screen (frame 300) before initializing
+    if (!g_st.ready && !g_st.initializing && current_frame > 300) {
         g_st.initializing = true;
         std::thread(InitDirectMLWorker).detach();
         return;
@@ -195,76 +289,13 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         device->create_resource(desc, nullptr, reshade::api::resource_usage::copy_dest, &g_st.aiTextureRes);
     }
 
-    if (g_st.ready && (current_frame % 2 == 0)) {
-        bool expected = false;
-        if (g_st.running.compare_exchange_strong(expected, true)) {
-            OrtValue* outputTensor = nullptr;
-
-            auto t0 = std::chrono::high_resolution_clock::now();
-
-            OrtStatus* status = g_st.ort->Run(
-                g_st.session,
-                nullptr,
-                g_st.inputNames,
-                (const OrtValue* const*)&g_st.inTensor,
-                1,
-                g_st.outputNames,
-                1,
-                &outputTensor
-            );
-
-            auto t1 = std::chrono::high_resolution_clock::now();
-            float ms = std::chrono::duration<float, std::milli>(t1 - t0).count();
-            g_st.last_ai_ms.store(ms);
-
-            if (status != nullptr) {
-                if (g_st.log.is_open()) {
-                    g_st.log << "[NeuralShader] Inference error: " << g_st.ort->GetErrorMessage(status) << "\n";
-                    g_st.log.flush();
-                }
-                g_st.ort->ReleaseStatus(status);
-                g_st.failed = true;
-            } else {
-                if (outputTensor) {
-                    float* outData = nullptr;
-                    g_st.ort->GetTensorMutableData(outputTensor, reinterpret_cast<void**>(&outData));
-
-                    // Convert AI planar RGB [3, 432, 768] into packed RGBA8
-                    if (outData != nullptr) {
-                        const int planeSize = IN_WIDTH * IN_HEIGHT;
-                        const float* rPlane = outData;
-                        const float* gPlane = outData + planeSize;
-                        const float* bPlane = outData + 2 * planeSize;
-                        uint8_t* dst = g_st.pixelBufferRGBA.data();
-
-                        for (int i = 0; i < planeSize; ++i) {
-                            dst[i * 4 + 0] = static_cast<uint8_t>(std::clamp(rPlane[i], 0.0f, 1.0f) * 255.0f);
-                            dst[i * 4 + 1] = static_cast<uint8_t>(std::clamp(gPlane[i], 0.0f, 1.0f) * 255.0f);
-                            dst[i * 4 + 2] = static_cast<uint8_t>(std::clamp(bPlane[i], 0.0f, 1.0f) * 255.0f);
-                            dst[i * 4 + 3] = 255;
-                        }
-                        g_st.has_new_frame.store(true);
-                    }
-                    g_st.ort->ReleaseValue(outputTensor);
-                }
-
-                uint64_t ai = ++g_st.ai_count;
-                if (ai % 60 == 0) {
-                    char titleBuf[128];
-                    snprintf(titleBuf, sizeof(titleBuf), "Forza Horizon 2 [AI Frames: %llu | %.1f ms]", (unsigned long long)ai, ms);
-                    SetConsoleTitleA(titleBuf);
-
-                    if (g_st.log.is_open()) {
-                        g_st.log << "[NeuralShader] AI Output frame: " << ai << " (Game: " << current_frame << " | " << ms << " ms)\n";
-                        g_st.log.flush();
-                    }
-                }
-            }
-            g_st.running.store(false);
-        }
+    // Trigger non-blocking inference on alternate frames
+    if (g_st.ready && (current_frame % 2 == 0) && !g_st.trigger_inference.load()) {
+        g_st.trigger_inference = true;
+        g_st.cv.notify_one();
     }
 
-    // Paint the model's actual rendered frame onto the backbuffer
+    // Blit the latest ready AI frame to the screen
     if (g_st.has_new_frame.load() && g_st.aiTextureRes.handle != 0 && swapchain != nullptr && queue != nullptr) {
         auto device = swapchain->get_device();
         auto cmdList = queue->get_immediate_command_list();
@@ -295,8 +326,8 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     }
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (AI Screen Output)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "DirectML Runtime Displaying AI Frames";
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (GTX 1650 Async DirectML)";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "TDR-Safe DirectML Runtime for Forza Horizon 2";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
@@ -322,7 +353,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
         reshade::unregister_addon(hinstDLL);
         CleanupORT();
         if (g_st.log.is_open()) {
-            g_st.log << "[NeuralShader] Addon detached.\n";
+            g_st.log << "[NeuralShader] Addon detached cleanly.\n";
             g_st.log.close();
         }
         break;
