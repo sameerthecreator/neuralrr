@@ -30,14 +30,15 @@ struct NeuralState {
     std::atomic<bool> initializing{false};
     std::atomic<bool> failed{false};
     
+    // User Toggle State
+    std::atomic<bool> is_active{false};
+    
     std::atomic<bool> should_exit{false};
     std::atomic<bool> trigger_inference{false};
-    std::atomic<bool> is_paused{false};
     std::atomic<bool> has_new_frame{false};
     
     std::mutex queueMutex;
     std::condition_variable cv;
-    std::mutex inferMutex;
     std::thread workerThread;
 
     std::atomic<uint64_t> frame_count{0};
@@ -87,7 +88,7 @@ static void CleanupORT() {
 
 static void InferenceLoop() {
     if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] Inference thread active.\n";
+        g_st.log << "[NeuralShader] Inference thread active and standing by.\n";
         g_st.log.flush();
     }
 
@@ -97,12 +98,6 @@ static void InferenceLoop() {
 
         if (g_st.should_exit) break;
         g_st.trigger_inference = false;
-
-        if (g_st.is_paused) continue;
-
-        std::lock_guard<std::mutex> inferLock(g_st.inferMutex);
-
-        if (g_st.is_paused) continue;
 
         OrtValue* outputTensor = nullptr;
         auto t0 = std::chrono::high_resolution_clock::now();
@@ -156,22 +151,21 @@ static void InferenceLoop() {
             uint64_t ai = ++g_st.ai_count;
             if (ai % 60 == 0) {
                 char titleBuf[128];
-                snprintf(titleBuf, sizeof(titleBuf), "Forza Horizon 2 [AI Frames: %llu | %.1f ms]", (unsigned long long)ai, ms);
+                snprintf(titleBuf, sizeof(titleBuf), "FH2 [AI ACTIVE: %llu Frames | Latency: %.1f ms]", (unsigned long long)ai, ms);
                 SetConsoleTitleA(titleBuf);
-
-                if (g_st.log.is_open()) {
-                    g_st.log << "[NeuralShader] Output frame: " << ai << " (Latency: " << ms << " ms)\n";
-                    g_st.log.flush();
-                }
             }
         }
     }
 }
 
 static void InitDirectMLWorker() {
+    if (g_st.log.is_open()) {
+        g_st.log << "[NeuralShader] Initializing DirectML...\n";
+        g_st.log.flush();
+    }
+
     g_st.hOrt = LoadLibraryA("onnxruntime.dll");
     if (!g_st.hOrt) {
-        if (g_st.log.is_open()) g_st.log << "[NeuralShader] ERROR: Failed to load onnxruntime.dll\n";
         g_st.failed = true;
         return;
     }
@@ -195,6 +189,7 @@ static void InitDirectMLWorker() {
     g_st.ort->CreateSessionOptions(&g_st.sessionOptions);
     g_st.ort->SetIntraOpNumThreads(g_st.sessionOptions, 1);
     
+    // Critical TDR protections
     g_st.ort->DisableCpuMemArena(g_st.sessionOptions);
     g_st.ort->DisableMemPattern(g_st.sessionOptions);
     g_st.ort->SetSessionGraphOptimizationLevel(g_st.sessionOptions, ORT_ENABLE_BASIC);
@@ -240,50 +235,51 @@ static void InitDirectMLWorker() {
     g_st.workerThread = std::thread(InferenceLoop);
 
     if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] DirectML active on GTX 1650. Protections enabled.\n";
+        g_st.log << "[NeuralShader] DirectML active on GTX 1650. Ready to compute.\n";
         g_st.log.flush();
     }
 
     g_st.ready = true;
 }
 
-// Added the missing 'bool resize' parameter here
 static void on_init_swapchain(reshade::api::swapchain* swapchain, bool resize) {
-    g_st.is_paused = false;
     if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] Swapchain initialized. Resuming.\n";
+        g_st.log << "[NeuralShader] Swapchain initialized.\n";
         g_st.log.flush();
     }
 }
 
-// Added the missing 'bool resize' parameter here
 static void on_destroy_swapchain(reshade::api::swapchain* swapchain, bool resize) {
-    g_st.is_paused = true;
-    
-    std::lock_guard<std::mutex> inferLock(g_st.inferMutex);
-
     if (g_st.aiTextureRes.handle != 0 && swapchain != nullptr) {
         swapchain->get_device()->destroy_resource(g_st.aiTextureRes);
         g_st.aiTextureRes = {};
         g_st.has_new_frame = false;
     }
-
-    if (g_st.log.is_open()) {
-        g_st.log << "[NeuralShader] Swapchain destroyed. Inference paused safely.\n";
-        g_st.log.flush();
-    }
 }
 
 static void on_present(reshade::api::command_queue* queue, reshade::api::swapchain* swapchain, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
-    if (g_st.failed || g_st.is_paused) return;
+    if (g_st.failed) return;
+
+    // Listen for the F8 key to toggle the AI on and off
+    static bool f8_was_down = false;
+    bool f8_is_down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+    
+    if (f8_is_down && !f8_was_down) {
+        g_st.is_active = !g_st.is_active;
+        if (g_st.is_active && !g_st.ready && !g_st.initializing) {
+            g_st.initializing = true;
+            std::thread(InitDirectMLWorker).detach();
+        }
+        if (!g_st.is_active) {
+            SetConsoleTitleA("Forza Horizon 2 [AI PAUSED]");
+        }
+    }
+    f8_was_down = f8_is_down;
+
+    // Only run if the user toggled it ON
+    if (!g_st.is_active) return;
 
     uint64_t current_frame = ++g_st.frame_count;
-
-    if (!g_st.ready && !g_st.initializing && current_frame > 300) {
-        g_st.initializing = true;
-        std::thread(InitDirectMLWorker).detach();
-        return;
-    }
 
     if (g_st.ready && g_st.aiTextureRes.handle == 0 && swapchain != nullptr) {
         auto device = swapchain->get_device();
@@ -300,7 +296,15 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
         device->create_resource(desc, nullptr, reshade::api::resource_usage::copy_dest, &g_st.aiTextureRes);
     }
 
+    // Generate dynamic pattern into the tensor so the AI actually has changing data to compute
     if (g_st.ready && (current_frame % 2 == 0) && !g_st.trigger_inference.load()) {
+        
+        // Feed live moving data to the model
+        float phase = current_frame * 0.05f;
+        for (int i = 0; i < IN_WIDTH * IN_HEIGHT; ++i) {
+            g_st.inputData[i] = 0.5f + 0.5f * sinf(phase + i * 0.001f);
+        }
+
         g_st.trigger_inference = true;
         g_st.cv.notify_one();
     }
@@ -335,8 +339,8 @@ static void on_present(reshade::api::command_queue* queue, reshade::api::swapcha
     }
 }
 
-extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (AI Screen Output)";
-extern "C" __declspec(dllexport) const char* DESCRIPTION = "Async DirectML Runtime with Transition Safety";
+extern "C" __declspec(dllexport) const char* NAME = "Neural Shader (Manual Toggle)";
+extern "C" __declspec(dllexport) const char* DESCRIPTION = "Async DirectML Runtime with F8 Toggle";
 
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
     switch (fdwReason) {
@@ -349,7 +353,7 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID) {
 
         g_st.log.open("neural_shader_debug.txt", std::ios::out);
         if (g_st.log.is_open()) {
-            g_st.log << "[NeuralShader] Addon attached.\n";
+            g_st.log << "[NeuralShader] Addon attached. Waiting for F8 keypress.\n";
             g_st.log.flush();
         }
 
